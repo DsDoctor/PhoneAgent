@@ -51,13 +51,24 @@ public final class MainActivity extends Activity {
         }
         @Override public void onOutput(String text) {
             runOnUiThread(() -> {
-                output.setText(text == null || text.isEmpty() ? welcome() : text);
+                if (text != null && !text.isEmpty()) {
+                    output.setText(text);
+                    if (!controller.isRunning() && text.contains("【任务结束】"))
+                        contentScroll.post(() -> contentScroll.fullScroll(View.FOCUS_DOWN));
+                }
+                else if (controller.isRunning()) output.setText("任务已开始，正在等待执行进度…");
+                else if (controller.getVisualState() == AgentController.VisualState.ERROR
+                        || controller.getVisualState() == AgentController.VisualState.STOPPED
+                        || controller.getVisualState() == AgentController.VisualState.SUCCESS)
+                    output.setText("本次任务没有可显示的正文，请查看上方状态。");
+                else output.setText(welcome());
             });
         }
         @Override public void onFinished(boolean success, String message) {
             runOnUiThread(() -> {
                 state.setText(message);
                 refreshState();
+                contentScroll.post(() -> contentScroll.fullScroll(View.FOCUS_DOWN));
             });
         }
         @Override public void onVisualState(AgentController.VisualState value) {

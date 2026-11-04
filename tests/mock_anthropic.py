@@ -13,8 +13,10 @@ from urllib.parse import urlsplit
 
 SEQUENCE = ("home", "read_screen", "open_settings", "read_screen")
 READY_SEQUENCE = ("home", "read_screen", "open_app_ready", "read_screen")
+LONG_SEQUENCE = ("read_screen",) * 31
 TEST_MODEL = "phoneagent-smoke-model"
 READY_MODEL = "phoneagent-smoke-ready"
+LONG_MODEL = "phoneagent-smoke-long"
 TEST_KEY = "local-test-only"
 
 
@@ -32,7 +34,8 @@ def make_response(request):
     errors = [result for result in results if result.get("is_error")]
     if errors:
         raise ValueError("The preceding phone tool returned an error; refusing a false success")
-    sequence = READY_SEQUENCE if request.get("model") == READY_MODEL else SEQUENCE
+    model = request.get("model")
+    sequence = {READY_MODEL: READY_SEQUENCE, LONG_MODEL: LONG_SEQUENCE}.get(model, SEQUENCE)
     if step < len(sequence):
         operation = sequence[step]
         candidates = [tool.get("name") for tool in request.get("tools", [])
@@ -45,10 +48,13 @@ def make_response(request):
         block = {"type": "tool_use", "id": f"toolu_local_smoke_{step}", "name": candidates[0], "input": arguments}
         stop = "tool_use"
     else:
-        block = {"type": "text", "text": "本地联调完成：已返回桌面、读取界面、打开设置并再次读取界面。本结果来自固定测试响应，尚未验证真实外部模型。"}
+        text = ("31轮只读联调完成：已连续调用31次手机读屏工具。本结果来自固定本地测试响应，没有调用真实外部模型。"
+                if model == LONG_MODEL else
+                "本地联调完成：已返回桌面、读取界面、打开设置并再次读取界面。本结果来自固定测试响应，尚未验证真实外部模型。")
+        block = {"type": "text", "text": text}
         stop = "end_turn"
     return {"id": f"msg_local_smoke_{step}", "type": "message", "role": "assistant",
-            "model": READY_MODEL if request.get("model") == READY_MODEL else TEST_MODEL,
+            "model": model if model in (READY_MODEL, LONG_MODEL) else TEST_MODEL,
             "content": [block], "stop_reason": stop, "stop_sequence": None,
             "usage": {"input_tokens": 128 + step * 16, "output_tokens": 32}}
 
@@ -125,8 +131,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         block = message["content"][0]
         print("LOCAL FIXTURE: " + (block["name"] if block["type"] == "tool_use" else "final response"), flush=True)
-        # Give Android a short transition window before requesting the next action.
-        time.sleep(0.35)
+        # The long fixture performs only reads, with no artificial transition wait.
+        time.sleep(0.02 if request.get("model") == LONG_MODEL else 0.35)
         if not request.get("stream"):
             self.send_json(200, message)
             return

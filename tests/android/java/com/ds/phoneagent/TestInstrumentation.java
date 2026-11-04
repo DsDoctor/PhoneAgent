@@ -3,6 +3,7 @@ package com.ds.phoneagent;
 import android.app.Activity;
 import android.app.Instrumentation;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ResolveInfo;
@@ -21,6 +22,7 @@ import org.json.JSONObject;
 import org.json.JSONArray;
 import java.io.*;
 import java.lang.reflect.Field;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.lang.reflect.InvocationTargetException;
 import java.net.*;
@@ -93,6 +95,8 @@ public final class TestInstrumentation extends Instrumentation {
             else if ("overlay".equals(mode)) overlay();
             else if ("pet".equals(mode)) pet();
             else if ("routines".equals(mode)) routines();
+            else if ("longtask".equals(mode)) longTask();
+            else if ("taskstore".equals(mode)) taskStore();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -482,6 +486,7 @@ public final class TestInstrumentation extends Instrumentation {
         ControllerProbe completed = new ControllerProbe();
         ControllerProbe stopped = new ControllerProbe();
         ControllerProbe failed = new ControllerProbe();
+        ControllerProbe noResult = new ControllerProbe();
         List<String> changedModelKeys = new CopyOnWriteArrayList<>();
         SharedPreferences settings = getTargetContext().getSharedPreferences("phoneagent", Context.MODE_PRIVATE);
         SharedPreferences.OnSharedPreferenceChangeListener configurationObserver = (preferences, key) -> {
@@ -510,6 +515,7 @@ public final class TestInstrumentation extends Instrumentation {
             assertStatesInOrder(completed, AgentController.VisualState.THINKING,
                     AgentController.VisualState.ACTING, AgentController.VisualState.THINKING,
                     AgentController.VisualState.SUCCESS);
+            assertFinalTaskLog(controller, completed, "success", "success");
             // Use an independent bridge only to verify the displayed package; it does
             // not participate in the Controller's model-driven execution.
             try (PhoneToolServer verification = new PhoneToolServer(name -> { })) {
@@ -541,6 +547,7 @@ public final class TestInstrumentation extends Instrumentation {
                     "Controller did not publish STOPPED visual state: " + controller.getVisualState());
             assertStatesInOrder(stopped, AgentController.VisualState.THINKING,
                     AgentController.VisualState.STOPPING, AgentController.VisualState.STOPPED);
+            assertFinalTaskLog(controller, stopped, "stopped", "user_stop");
             log("Controller Stop callback, running flag and process cleanup verified");
             assertTerminalReset(controller, stopped, "STOPPED");
 
@@ -553,9 +560,29 @@ public final class TestInstrumentation extends Instrumentation {
             check(failed.finished.await(90, TimeUnit.SECONDS), "Intentional local error task did not finish");
             check(!failed.success.get() && controller.getVisualState() == AgentController.VisualState.ERROR,
                     "Local fixture did not produce Controller ERROR: " + failed.message.get());
-            check(failed.output.get().contains("Intentional local fixture failure"),
-                    "ERROR was not caused by the intentional local fixture response: " + failed.output.get());
+            check(failed.output.get().contains("HTTP 状态：400"),
+                    "Local HTTP 400 did not produce a safe status hint in the final log");
+            assertFinalTaskLog(controller, failed, "error", "error_result");
             assertErrorResetButton(controller);
+
+            runOnMainSync(() -> {
+                controller.setListener(noResult);
+                controller.run("本地CLI中断日志测试，不需要操作手机。", "http://127.0.0.1:9",
+                        "phoneagent-smoke-model", "local-test-only");
+            });
+            long processDeadline = SystemClock.uptimeMillis() + 5000;
+            Process interrupted = null;
+            while (SystemClock.uptimeMillis() < processDeadline && controller.isRunning()) {
+                interrupted = (Process) processField.get(controller);
+                if (interrupted != null && interrupted.isAlive()) break;
+                SystemClock.sleep(50);
+            }
+            check(interrupted != null && interrupted.isAlive(), "No live CLI process for missing-result fault injection");
+            interrupted.destroyForcibly(); // Deliberately not Controller.stop(): no user-stop flag.
+            check(noResult.finished.await(15, TimeUnit.SECONDS), "Controller did not finish after CLI termination");
+            check(!noResult.success.get() && !controller.isRunning(), "Terminated CLI incorrectly remained active/succeeded");
+            assertFinalTaskLog(controller, noResult, "error", "cli_no_result");
+            assertTerminalReset(controller, noResult, "CLI_NO_RESULT");
             check(changedModelKeys.isEmpty(), "Controller/reset modified model configuration keys: " + changedModelKeys);
             log("SUCCESS, STOPPED and UI ERROR reset preserved output and model configuration; running reset was rejected");
         } finally {
@@ -564,6 +591,7 @@ public final class TestInstrumentation extends Instrumentation {
                 controller.removeListener(completed);
                 controller.removeListener(stopped);
                 controller.removeListener(failed);
+                controller.removeListener(noResult);
             });
             settings.unregisterOnSharedPreferenceChangeListener(configurationObserver);
         }
@@ -587,17 +615,21 @@ public final class TestInstrumentation extends Instrumentation {
     private void assertTerminalReset(AgentController controller, ControllerProbe probe, String source) throws Exception {
         check(!controller.isRunning() && controller.canResetToIdle(), source + " should permit reset");
         String beforeOutput = controllerOutput(controller);
+        String beforeRecord = lastTaskSnapshot();
         int beforeFinished = probe.finishedCallbacks.get();
         runOnMainSync(controller::resetToIdle);
         waitForControllerState(controller, AgentController.VisualState.IDLE);
         check(!controller.isRunning(), source + " reset started a task");
         check(beforeOutput.equals(controllerOutput(controller)), source + " reset changed the retained output");
         check(probe.finishedCallbacks.get() == beforeFinished, source + " reset fabricated a completion callback");
+        check(beforeRecord.equals(lastTaskSnapshot()), source + " reset modified the persisted task record");
+        requireAcknowledgedRecord(source);
         log(source + " reset to IDLE while retaining task output");
     }
 
     private void assertErrorResetButton(AgentController controller) throws Exception {
         String beforeOutput = controllerOutput(controller);
+        String beforeRecord = lastTaskSnapshot();
         runOnMainSync(() -> getTargetContext().startActivity(new Intent(getTargetContext(), MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
         waitForMainActivityVisible();
@@ -629,6 +661,8 @@ public final class TestInstrumentation extends Instrumentation {
         waitForControllerState(controller, AgentController.VisualState.IDLE);
         check(!controller.isRunning(), "UI reset started a task");
         check(beforeOutput.equals(controllerOutput(controller)), "UI ERROR reset changed retained output");
+        check(beforeRecord.equals(lastTaskSnapshot()), "UI ERROR reset modified the persisted task record");
+        requireAcknowledgedRecord("UI ERROR");
         AtomicBoolean enabled = new AtomicBoolean(true);
         runOnMainSync(() -> {
             try {
@@ -640,6 +674,176 @@ public final class TestInstrumentation extends Instrumentation {
         if (failure.get() != null) throw failure.get();
         check(!enabled.get(), "Reset action remains enabled after reaching IDLE");
         log("Actual stop/reset button changed ERROR to IDLE without clearing task output");
+    }
+
+    private void assertFinalTaskLog(AgentController controller, ControllerProbe probe, String state, String reason) throws Exception {
+        String output = controllerOutput(controller);
+        check(output.contains("【任务结束】"), state + " did not publish a final task log");
+        check(output.equals(probe.output.get()), state + " final log was not delivered to the listener");
+        JSONObject record = new LastTaskStore(getTargetContext()).read();
+        check(record != null, state + " task record was not persisted");
+        check(state.equals(record.optString("state")), "Persisted task state mismatch: " + record.optString("state"));
+        check(reason.equals(record.optString("reason")), "Persisted termination reason mismatch: " + record.optString("reason"));
+        check(!record.optBoolean("acknowledged"), "A newly finished task was already marked acknowledged");
+        check(record.optLong("started_at") > 0 && record.optLong("ended_at") > 0
+                        && record.optLong("ended_at") >= record.optLong("started_at"),
+                "Final task record has no valid completion time");
+        check(output.equals(record.optString("output")), "Persisted task output differs from final UI output");
+        for (String forbidden : new String[]{"prompt", "model", "base_url", "baseUrl", "api_key", "apiKey", "key"})
+            check(!record.has(forbidden), "Task record unexpectedly includes configuration field: " + forbidden);
+        log("Final task log persisted: " + state + " / " + reason);
+    }
+
+    private String lastTaskSnapshot() throws Exception {
+        JSONObject record = new LastTaskStore(getTargetContext()).read();
+        check(record != null, "No task record to preserve across reset");
+        return historicalRecordSnapshot(record);
+    }
+
+    private static String historicalRecordSnapshot(JSONObject record) throws Exception {
+        JSONObject historical = new JSONObject(record.toString());
+        historical.remove("acknowledged");
+        return historical.toString();
+    }
+
+    private void requireAcknowledgedRecord(String source) {
+        JSONObject record = new LastTaskStore(getTargetContext()).read();
+        check(record != null && record.optBoolean("acknowledged"), source + " reset did not persist acknowledgment");
+    }
+
+    /** More than the old thirty-turn limit, using only read_screen and a local fixture. */
+    private void longTask() throws Exception {
+        long serviceDeadline = SystemClock.uptimeMillis() + 15000;
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Enable accessibility before longtask test");
+        AgentController controller = AgentController.get(getTargetContext());
+        check(controller.isReady() && !controller.isRunning(), "Runtime must be ready and idle");
+        try (PhoneToolServer verification = new PhoneToolServer(name -> { })) {
+            waitForPackage(verification, getTargetContext().getPackageName());
+        }
+        ControllerProbe probe = new ControllerProbe();
+        try {
+            runOnMainSync(() -> {
+                controller.setListener(probe);
+                controller.run("执行本地31轮只读联调，每轮读取当前界面，最后报告完成。",
+                        "http://127.0.0.1:18080", "phoneagent-smoke-long", "local-test-only");
+            });
+            check(probe.finished.await(180, TimeUnit.SECONDS), "31-read fixture did not finish within the test's own timeout");
+            check(probe.success.get() && !controller.isRunning(), "31-read task did not complete: " + probe.message.get());
+            check(probe.output.get().contains("31轮只读联调完成"), "CLI did not reach the fixture's final response");
+            int actions = 0;
+            for (AgentController.VisualState state : probe.states)
+                if (state == AgentController.VisualState.ACTING) actions++;
+            check(actions >= 31, "Observed fewer than 31 actual phone-tool executions: " + actions);
+            assertFinalTaskLog(controller, probe, "success", "success");
+            log("Real Claude Code completed at least 31 read-only tool turns with the local fixture");
+        } finally {
+            runOnMainSync(() -> { controller.stop(); controller.removeListener(probe); });
+        }
+    }
+
+    /** File-backed restart/recovery checks in a unique cache directory, not user task data. */
+    private void taskStore() throws Exception {
+        File directory = new File(getTargetContext().getCacheDir(), "taskstore-smoke-" + UUID.randomUUID());
+        check(!directory.exists(), "Unique task-store test directory already exists");
+        Context isolated = new ContextWrapper(getTargetContext()) {
+            @Override public File getFilesDir() { return directory; }
+            @Override public Context getApplicationContext() { return this; }
+        };
+        ControllerProbe restoredProbe = new ControllerProbe();
+        ControllerProbe acknowledgedProbe = new ControllerProbe();
+        ControllerProbe interruptedProbe = new ControllerProbe();
+        AgentController restored = null, acknowledged = null, interrupted = null;
+        try {
+            LastTaskStore store = new LastTaskStore(directory);
+            long now = System.currentTimeMillis();
+            String successOutput = "本地持久化测试输出\n\n【任务结束】\n状态：完成\n原因：success";
+            JSONObject complete = new JSONObject().put("version", 1).put("state", "success")
+                    .put("status", "本地测试已完成").put("output", successOutput)
+                    .put("started_at", now - 2000).put("updated_at", now - 1000).put("ended_at", now - 1000)
+                    .put("reason", "success").put("exit_code", 0).put("num_turns", 32);
+            store.write(complete);
+            JSONObject reread = new LastTaskStore(directory).read();
+            check(reread != null && successOutput.equals(reread.optString("output")), "Rebuilt store lost the saved output");
+            restored = constructIsolatedController(isolated);
+            AgentController restoredController = restored;
+            runOnMainSync(() -> restoredController.setListener(restoredProbe));
+            runOnMainSync(() -> { });
+            check(!restored.isRunning() && restored.getVisualState() == AgentController.VisualState.SUCCESS,
+                    "Rebuilt Controller did not restore completed task state");
+            check(successOutput.equals(restoredProbe.output.get()), "Rebuilt Controller did not replay retained output");
+            check(complete.getString("status").equals(restoredProbe.status.get()), "Rebuilt Controller did not replay retained status");
+            log("Isolated store and Controller restored the completed task");
+
+            String errorOutput = "本地错误测试输出\n\n【任务结束】\n状态：未完成\n原因：error_result";
+            JSONObject error = new JSONObject(complete.toString()).put("state", "error")
+                    .put("status", "本地错误测试已结束").put("output", errorOutput)
+                    .put("reason", "error_result").put("exit_code", 1).put("acknowledged", false);
+            store.write(error);
+            String historicalError = historicalRecordSnapshot(store.read());
+            check(store.acknowledge(), "Isolated store could not acknowledge the terminal error");
+            JSONObject acknowledgedRecord = new LastTaskStore(directory).read();
+            check(acknowledgedRecord != null && acknowledgedRecord.optBoolean("acknowledged"), "Acknowledgment did not survive store reconstruction");
+            check(historicalError.equals(historicalRecordSnapshot(acknowledgedRecord)),
+                    "Acknowledgment changed historical task fields beyond its flag");
+            acknowledged = constructIsolatedController(isolated);
+            AgentController acknowledgedController = acknowledged;
+            runOnMainSync(() -> acknowledgedController.setListener(acknowledgedProbe));
+            runOnMainSync(() -> { });
+            AgentController.VisualState acknowledgedState = acknowledged.getVisualState();
+            check(!acknowledged.isRunning() && (acknowledgedState == AgentController.VisualState.IDLE
+                            || acknowledgedState == AgentController.VisualState.NEEDS_INPUT),
+                    "Rebuilt acknowledged Controller restored the old error presentation");
+            check(errorOutput.equals(acknowledgedProbe.output.get()), "Acknowledged restoration lost the historical error log");
+            check(historicalError.equals(historicalRecordSnapshot(new LastTaskStore(directory).read())),
+                    "Acknowledged Controller restoration rewrote historical task fields");
+            log("Acknowledged terminal error restores idle/setup presentation while retaining its historical log");
+
+            String runningOutput = "本地进行中记录，等待模拟进程重启";
+            store.write(new JSONObject().put("version", 1).put("state", "running").put("status", "测试运行中")
+                    .put("output", runningOutput).put("started_at", now).put("updated_at", now)
+                    .put("ended_at", 0).put("reason", "").put("acknowledged", true));
+            interrupted = constructIsolatedController(isolated);
+            AgentController interruptedController = interrupted;
+            runOnMainSync(() -> interruptedController.setListener(interruptedProbe));
+            runOnMainSync(() -> { });
+            check(!interrupted.isRunning() && interrupted.getVisualState() == AgentController.VisualState.ERROR,
+                    "Rebuilt Controller did not mark an abandoned running task as interrupted");
+            JSONObject recovered = new LastTaskStore(directory).read();
+            check(recovered != null && "interrupted".equals(recovered.optString("state"))
+                    && "process_interrupted".equals(recovered.optString("reason")), "Running record was not recovered as interrupted");
+            check(!recovered.optBoolean("acknowledged"), "Interrupted recovery retained an obsolete acknowledgment");
+            check(recovered.optLong("ended_at") >= recovered.optLong("started_at") && recovered.optLong("ended_at") > 0,
+                    "Interrupted recovery did not record its completion time");
+            String recoveredOutput = recovered.getString("output");
+            check(recoveredOutput.startsWith(runningOutput) && recoveredOutput.contains("【任务结束】"),
+                    "Interrupted recovery lost earlier output or omitted its final log");
+            check(recoveredOutput.equals(interruptedProbe.output.get()), "Interrupted recovery was not replayed to the UI listener");
+            JSONObject recoveredAgain = new LastTaskStore(directory).recoverInterrupted();
+            check(recoveredAgain != null && recoveredOutput.equals(recoveredAgain.optString("output")),
+                    "Repeated recovery appended duplicate final logs");
+            log("Abandoned running record recovered once as interrupted, with a final log and no active task");
+        } finally {
+            AgentController first = restored, second = interrupted, third = acknowledged;
+            runOnMainSync(() -> {
+                if (first != null) first.removeListener(restoredProbe);
+                if (second != null) second.removeListener(interruptedProbe);
+                if (third != null) third.removeListener(acknowledgedProbe);
+            });
+            deleteTestTree(directory);
+        }
+        log("Only the isolated task-store cache directory was removed");
+    }
+
+    private AgentController constructIsolatedController(Context context) throws Exception {
+        Constructor<AgentController> constructor = AgentController.class.getDeclaredConstructor(Context.class);
+        constructor.setAccessible(true);
+        try { return constructor.newInstance(context); }
+        catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception) throw (Exception) failure.getCause();
+            throw failure;
+        }
     }
 
     private void waitForControllerState(AgentController controller, AgentController.VisualState expected) {

@@ -73,6 +73,26 @@ The controller test also requires visual-state callbacks in the order `THINKING 
 
 The same run covers resetting to idle without repeating those success/stop tasks: SUCCESS and STOPPED reset to IDLE while retaining `lastOutput`, and reset during the unreachable-loopback task must be a strict no-op. A third task uses the fixture-only model name `phoneagent-smoke-error`, which returns an intentional HTTP 400 and produces a real Controller ERROR. The test clicks MainActivity's existing stop button after it changes to an enabled “重置” action, then checks IDLE and retained output. It observes model-setting **change keys only**, never their values or credentials, and requires that no model setting changed. No product test endpoint or real model request is involved.
 
+Each success, error and manual-stop outcome must now publish and persist a `【任务结束】` log with the expected state/reason and completion time. Reset must preserve output and all historical record fields; only `acknowledged` may change, and it must become true. Newly completed tasks must not already be acknowledged. The controlled HTTP 400 must appear as a safe status hint; the test does not require the original provider body to be displayed. A final task targets only unreachable loopback; the test terminates its CLI process directly, without calling Controller.stop, to verify that a missing normal CLI result still produces an ERROR final log with `cli_no_result`. These real test tasks become the app's most recent task record; they contain only local fixture output and no real model configuration.
+
+## More than thirty tool turns
+
+`longtask` uses the independent local fixture model `phoneagent-smoke-long`, which requests exactly 31 successive `read_screen` calls before its final response. Responses use a short 20 ms fixture interval because no app transition is needed. The test requires successful completion, at least 31 ACTING callbacks from real phone tools, and a final persisted log. It does not use or alter a real model service. The test harness retains its own three-minute failure timeout; this is not an app task limit.
+
+Start the local fixture and reverse its port as above, then run:
+
+```bash
+python3 scripts/test-device.py longtask
+```
+
+## Recent-task persistence and restart recovery
+
+`taskstore` uses a unique cache directory and synthetic records. It rebuilds LastTaskStore and an isolated Controller to verify terminal-state/output restoration. An acknowledged terminal error must restore IDLE (or NEEDS_INPUT because the isolated runtime is uninstalled), retain its historical error log and leave all historical fields unchanged. The test then simulates an abandoned `running` record. Recovery must mark it `interrupted` with reason `process_interrupted`, clear any obsolete acknowledgment, append a final log, expose ERROR with `isRunning=false`, and remain idempotent on another recovery. Only the temporary cache directory is removed; real app data is not cleared. This mode needs no model, fixture server or reversed port.
+
+```bash
+python3 scripts/test-device.py taskstore
+```
+
 ## Overlay and cat animation
 
 `overlay` verifies that the bubble is hidden inside MainActivity, attached using `TYPE_ACCESSIBILITY_OVERLAY` on Home and Settings, and returns to the app when tapped. It then invokes the real phone-control button listener and goes directly Home from accessibility settings, exercising the previous stale-visibility regression. The Settings bubble is tapped with a real accessibility gesture; the control-button listener is invoked on the UI thread to avoid unrelated return-animation hit testing. Attached/view visibility alone does not prove compositor visibility; inspect the actual Settings window or `dumpsys window` as well.

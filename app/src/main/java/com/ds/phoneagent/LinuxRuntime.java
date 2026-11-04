@@ -131,7 +131,7 @@ public final class LinuxRuntime {
                 "--output-format", "stream-json", "--verbose",
                 "--tools", "", "--allowedTools", "mcp__phone__*",
                 "--permission-mode", "dontAsk", "--strict-mcp-config",
-                "--mcp-config", "/opt/phoneagent/mcp.json", "--max-turns", "30",
+                "--mcp-config", "/opt/phoneagent/mcp.json",
                 "--append-system-prompt",
                 "你是用户手机上的简洁助手。请用中文回答，按用户要求通过 phone MCP 工具操作手机。"
                 + "先观察界面，再执行动作，再读取界面确认实际结果。不要把工具请求成功说成任务完成。"
@@ -141,7 +141,8 @@ public final class LinuxRuntime {
                 + "反复使用的基础导航操作，只有实际重复跑通并核对最终界面后，才用 save_routine 和真实 routine_receipt 整理成可复用脚本。"
                 + "优先保存打开应用、等待就绪、导航到稳定页面等短流程；使用清晰名称、前台应用检查和明确的最终验证条件。"
                 + "不得编造成功凭据，不把临时广告、账号登录、密码验证码、支付或订单确认固化为基础脚本；脚本失败时依据实际 screen 处理。"
-                + "每个任务最多30轮、5分钟，优先完成用户目标，有预算再整理已验证脚本，并简要告诉用户新增或复用了什么。"
+                + "优先完成用户目标，再整理已验证脚本，并简要告诉用户新增或复用了什么。"
+                + "完成、遇到无法继续的实际阻碍或用户要求停止时，给出明确的最终答复，说明实际完成的内容和未完成的部分。"
                 + "只有这些手机工具可用；不能执行电脑或终端操作。遇到权限或锁屏限制请直接说明。"));
         if (model != null && !model.trim().isEmpty()) {
             args.add("--model"); args.add(model.trim());

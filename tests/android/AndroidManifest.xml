@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.ds.phoneagent.tests"
+    android:versionCode="1"
+    android:versionName="0.1">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:label="PhoneAgent device tests" android:allowBackup="false" />
+    <instrumentation
+        android:name="com.ds.phoneagent.TestInstrumentation"
+        android:targetPackage="com.ds.phoneagent"
+        android:handleProfiling="false"
+        android:functionalTest="true" />
+</manifest>

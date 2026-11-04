@@ -17,6 +17,8 @@ local.properties
 /logs/
 /screenshots/
 /downloads/
+/app/src/main/assets/runtime/
+/app/src/main/jniLibs/
 *.log
 *.apk
 *.aab

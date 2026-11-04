@@ -1,56 +1,82 @@
 # PhoneAgent
 
-AIResearch（AI 研究所）下的手机端 Agent 实验项目：把旧 Android 手机变成可以接受语音或文字指令、执行多步手机操作的智能助手。
+运行在 Android 手机上的轻量 Agent 原型，属于 AIResearch（AI 研究所）子项目。通过悬浮球进入，输入文字任务，由手机后台的 Claude Code 调用工具操作手机。
 
-仓库：[DsDoctor/PhoneAgent](https://github.com/DsDoctor/PhoneAgent)
+本项目独立实现 Android App、工具桥接和运行时装配，没有复制 Buddy 的代码或界面。Linux 只提供后台运行环境，没有桌面或终端入口。
 
-## 方案方向
+## 第一版范围
 
-优先验证 **Buddy + Claude Code + 外部云端模型**：在手机本地运行真正的 Claude Code，复用其 Agent Loop、上下文与会话管理，通过 MCP 调用手机控制工具。
+- 中文任务界面、可拖动悬浮球、前台通知和停止按钮。
+- App 私有目录中的 Alpine Linux + PRoot，运行官方 Claude Code ARM64 二进制。
+- 可配置兼容 Anthropic API 的外部模型地址、模型名和 API Key。
+- 通过本机 MCP 工具读取界面、返回桌面、返回上一级、打开设置或应用、点击、滑动、输入文字。
+- API Key 用 AndroidKeyStore 加密保存在手机，设备工具接口只监听本机，并使用每次任务独立的随机令牌。
+
+第一版使用无障碍界面节点进行观察，不包含截图视觉、语音、锁屏解锁或自动开机启动。执行任务会占用手机当前屏幕。外部模型由用户后续配置。
+
+## 运行方式
 
 ```text
-用户语音 / 文字
-    → Buddy App
-    → 手机本地 Claude Code ↔ 外部云端模型
-    → 本机 MCP 工具
+悬浮球 / 文字任务
+    → Android App
+    → 私有 Linux 用户空间中的 Claude Code ↔ 外部模型
+    → Python stdio MCP
+    → 带任务令牌的本机工具接口
     → Android 无障碍服务
-    → 读屏、点击、输入、滑动与结果检查
+    → 读取界面、执行动作、再次检查
 ```
 
-手机负责交互、任务循环和动作执行，模型推理由云端服务提供。候选实现为 [buddy-android](https://github.com/ghorbelhamdi/buddy-android)，本仓库用于沉淀调研、适配与实验结果。
+任务规划与工具调用循环由真正的 Claude Code 执行。CLI 的内置工具关闭，仅允许本项目的手机 MCP 工具；单次任务最多 12 轮、5 分钟，可在 App 或通知中主动停止。
 
-## 当前状态
+## 目标设备
 
-截至 **2026-11-04**：
+首个适配对象是华为畅享 50 Pro（CTR-AL00，8 GB RAM，HarmonyOS 4.2），ADB 实测为 **Android 12 / API 31 / ARM64**，无 root。其他机型尚未验证。
 
-- 已完成初步资料与源码调研，确定优先验证上述路线。
-- 已准备华为畅享 50 Pro（CTR-AL00，8 GB RAM，HarmonyOS 4.2），配置 ADB 和 Termux。
-- 尚未安装 Buddy、配置外部模型或完成实机验证；仓库目前以研究文档为主。
-- 设备实际 Android API 级别、中文语音、后台驻留和模型兼容性仍待验证。
+此原型使用 `minSdk 26 / targetSdk 28` 和调试签名，面向个人设备侧载验证。后续面向新系统或公开发行时，需要重新处理目标 SDK、进程执行和后台限制。
 
-## 验证计划
+## 构建与安装
 
-- [ ] 确认设备 Android API 级别与 CPU 架构，验证 Buddy 安装和 Claude Code 启动。
-- [ ] 选择外部模型，验证 API 连通、工具调用、流式响应和截图理解。
-- [ ] 在计算器、设置等场景验证读屏、点击、中文输入、滑动和结果检查。
-- [ ] 验证中文语音指令驱动多步手机操作。
-- [ ] 测试后台运行、长任务、熄屏、锁屏和系统清理后的恢复行为。
-- [ ] 选取具体业务流程，记录成功率、耗时、模型成本和人工介入次数。
-
-## 文档
-
-- [Buddy + Claude Code 方案调研](docs/research/2026-11-04-buddy-phone-agent.md)：工作方式、设备要求、运行边界与参考来源。
-
-## 项目组织与同步
-
-本项目位于 AIResearch 下的 `PhoneAgent/` 子目录，使用独立 Git 仓库，远端 `origin` 指向 `DsDoctor/PhoneAgent`，主分支为 `main`。
-
-在本项目目录中拉取更新：
+需要 Python 3.10+、JDK、Android SDK（platform、build-tools、platform-tools）。macOS 默认使用 Android Studio 自带 JBR 和 `~/Library/Android/sdk`；其他安装位置可设置 `JAVA_HOME`、`ANDROID_SDK_ROOT`。
 
 ```bash
-git pull --ff-only
+# 下载并校验固定版本的运行时组件，生成离线安装资产
+python3 scripts/prepare-runtime.py
+
+# 使用 Android SDK 工具链构建，不需要下载 Gradle 或 AndroidX
+python3 scripts/build.py
+
+# 安装到已连接的手机；按手机系统提示完成安装
+adb install --no-incremental -r build/PhoneAgent-debug.apk
 ```
 
-完成修改并检查待提交文件后，通过 `git commit` 和 `git push` 同步到 GitHub。这里使用普通 Git 同步，没有配置定时或自动推送。
+运行包约 140 MiB，首次准备会在 App 私有空间解包。构建产物、下载缓存和签名密钥位于被 Git 忽略的目录中。[运行时来源、固定版本和准备方式](scripts/RUNTIME.md)。
 
-设备原始维护记录保留在 AIResearch 的 `phone-maintenance/` 中。本仓库收录可分享的文档、代码与脱敏实验结果；凭据和原始设备输出放在被忽略的本地目录中。
+## 手机上使用
+
+1. 打开 PhoneAgent，点“准备环境”，等待运行环境就绪。
+2. 开启 PhoneAgent 无障碍服务和悬浮窗权限。
+3. 在“连接模型”填写兼容 Anthropic API 的 HTTPS 地址、模型名和 API Key。
+4. 输入“打开系统设置”等简单任务，点击“开始执行”。
+5. App 会退到后台，手机执行操作；点悬浮球返回查看结果，或用通知里的“停止任务”。
+
+华为系统可能限制后台进程。如果遇到任务被系统中断，在应用启动管理中允许 PhoneAgent 后台活动。锁屏时请先手动解锁，再执行需要界面的操作。
+
+## 验证
+
+已在目标华为设备完成运行环境、手机工具、中文输入、Claude Code 本地联调和停止流程验证，见 [实机验证记录](docs/validation/2026-11-04-huawei-ctr-al00.md)。真实外部模型按用户安排稍后配置。
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/build_android_tests.py
+```
+
+测试 APK 的安装与真机运行步骤见 [实机测试说明](tests/android/README.md)。本地固定响应的模拟模型仅用于验证 Claude Code → MCP → 手机操作链路，不代表任何真实外部模型的兼容性或任务能力。
+
+## 目录
+
+- `app/src/main/`：Android App、MCP 脚本与运行时资产位置。
+- `scripts/`：SDK 构建、运行时下载校验与固定依赖清单。
+- `tests/`：MCP 协议测试、Android 实机测试和本地模拟模型。
+- [早期方案调研](docs/research/2026-11-04-buddy-phone-agent.md)：保留最初参考与选型过程。
+
+远端仓库：[DsDoctor/PhoneAgent](https://github.com/DsDoctor/PhoneAgent)。在本目录中通过 `git pull --ff-only` 拉取更新，提交后使用 `git push` 同步。

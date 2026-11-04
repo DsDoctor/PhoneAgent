@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneAgent</string>
+    <string name="accessibility_label">PhoneAgent 手机控制</string>
+    <string name="accessibility_description">在你发起任务后，读取当前界面的文字和控件，执行点击、滑动、输入、返回和打开应用。可随时从悬浮球或通知停止任务。</string>
+</resources>

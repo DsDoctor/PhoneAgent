@@ -33,7 +33,7 @@ def enable_phone_tools():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("runtime", "tools", "loop", "controller", "input"))
+    parser.add_argument("mode", choices=("runtime", "tools", "loop", "controller", "input", "overlay", "pet"))
     args = parser.parse_args()
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP", capture=True)
     process = subprocess.Popen(["adb", "shell", "am", "instrument", "-w", "-e", "mode", args.mode,
@@ -53,7 +53,7 @@ def main():
     finally:
         if process.poll() is None:
             process.terminate()
-        adb("shell", "am", "start", "-n", "com.ds.phoneagent/.MainActivity", capture=True)
+        adb("shell", "am", "start", "-f", "0x24000000", "-n", "com.ds.phoneagent/.MainActivity", capture=True)
         enable_phone_tools()
     if not passed or code:
         raise SystemExit("Device test failed: " + args.mode)

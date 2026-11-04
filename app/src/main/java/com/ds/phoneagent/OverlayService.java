@@ -7,16 +7,15 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.graphics.Color;
 import android.graphics.PixelFormat;
-import android.graphics.drawable.GradientDrawable;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.TextView;
 
 /** Foreground notification and a draggable entry point; it never holds a permanent wake lock. */
 public final class OverlayService extends Service {
@@ -24,11 +23,14 @@ public final class OverlayService extends Service {
     public static final String ACTION_HIDE = "com.ds.phoneagent.HIDE_BUBBLE";
     public static final String ACTION_STOP_TASK = "com.ds.phoneagent.STOP_TASK";
     private static final String CHANNEL = "phone_agent_control";
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static volatile OverlayService instance;
     private static boolean activityVisible;
+    private WindowManager applicationWindowManager;
     private WindowManager windowManager;
-    private TextView bubble;
+    private MonthlyCatView bubble;
     private WindowManager.LayoutParams position;
+    private AgentController.VisualState petState = AgentController.VisualState.IDLE;
 
     public static void setActivityVisible(boolean visible) {
         activityVisible = visible;
@@ -40,10 +42,37 @@ public final class OverlayService extends Service {
         context.startForegroundService(new Intent(context, OverlayService.class).setAction(action));
     }
 
+    public static void setPetState(AgentController.VisualState value) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            MAIN.post(() -> setPetState(value));
+            return;
+        }
+        OverlayService service = instance;
+        if (service == null) return;
+        service.petState = value == null ? AgentController.VisualState.IDLE : value;
+        if (service.bubble != null) service.bubble.setState(service.petState);
+    }
+
+    /** Accessibility lifecycle callbacks and Activity callbacks run on the main thread. */
+    static void onAccessibilityConnectionChanged() {
+        OverlayService service = instance;
+        if (service == null) return;
+        // Rebuild even when the same service object reconnects: its window token may change.
+        service.removeBubble();
+        service.updateBubble();
+    }
+
+    /** Package-private diagnostics for instrumentation; no externally callable endpoint. */
+    static int currentWindowType() {
+        OverlayService service = instance;
+        return service == null || service.bubble == null || service.position == null ? 0 : service.position.type;
+    }
+
     @Override public void onCreate() {
         super.onCreate();
         instance = this;
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        petState = AgentController.get(this).getVisualState();
+        applicationWindowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         NotificationManager notifications = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         NotificationChannel channel = new NotificationChannel(CHANNEL, "手机助手", NotificationManager.IMPORTANCE_LOW);
         channel.setDescription("进入手机助手或立即停止当前任务");
@@ -53,7 +82,7 @@ public final class OverlayService extends Service {
         PendingIntent stop = PendingIntent.getService(this, 2, new Intent(this, OverlayService.class)
                 .setAction(ACTION_STOP_TASK), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification notification = new Notification.Builder(this, CHANNEL)
-                .setSmallIcon(R.drawable.ic_phone_agent)
+                .setSmallIcon(R.drawable.monthly_cat_icon)
                 .setContentTitle("PhoneAgent")
                 .setContentText("点此进入助手 · 可随时停止当前任务")
                 .setContentIntent(open)
@@ -76,28 +105,29 @@ public final class OverlayService extends Service {
     private android.content.SharedPreferences preferences() { return getSharedPreferences("phoneagent", MODE_PRIVATE); }
 
     private void updateBubble() {
-        boolean shouldShow = !activityVisible && Settings.canDrawOverlays(this)
-                && preferences().getBoolean("bubble_enabled", true);
+        WindowManager accessibilityWindowManager = PhoneAccessibilityService.overlayWindowManager();
+        boolean accessibilityOverlay = accessibilityWindowManager != null;
+        boolean shouldShow = !activityVisible && preferences().getBoolean("bubble_enabled", true)
+                && (accessibilityOverlay || Settings.canDrawOverlays(this));
         if (!shouldShow) { removeBubble(); return; }
-        if (bubble != null) return;
-        bubble = new TextView(this);
-        bubble.setText("P");
-        bubble.setContentDescription("打开 PhoneAgent");
-        bubble.setTextColor(Color.WHITE);
-        bubble.setTextSize(22);
-        bubble.setGravity(Gravity.CENTER);
-        bubble.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(Color.rgb(23, 106, 85));
-        background.setShape(GradientDrawable.OVAL);
-        background.setStroke(dp(2), Color.rgb(213, 236, 225));
-        bubble.setBackground(background);
-        bubble.setElevation(dp(6));
-        position = new WindowManager.LayoutParams(dp(50), dp(50), WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        WindowManager selectedManager = accessibilityOverlay ? accessibilityWindowManager : applicationWindowManager;
+        int selectedType = accessibilityOverlay ? WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                : WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        if (bubble != null && windowManager == selectedManager && position.type == selectedType) return;
+        removeBubble();
+        addBubble(selectedManager, selectedType);
+    }
+
+    private void addBubble(WindowManager selectedManager, int selectedType) {
+        windowManager = selectedManager;
+        petState = AgentController.get(this).getVisualState();
+        bubble = new MonthlyCatView(this);
+        bubble.setState(petState);
+        position = new WindowManager.LayoutParams(dp(72), dp(84), selectedType,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         position.gravity = Gravity.TOP | Gravity.LEFT;
-        position.x = preferences().getInt("bubble_x", Math.max(0, getResources().getDisplayMetrics().widthPixels - dp(58)));
+        position.x = preferences().getInt("bubble_x", Math.max(0, getResources().getDisplayMetrics().widthPixels - dp(80)));
         position.y = preferences().getInt("bubble_y", dp(190));
         clampPosition();
         bubble.setOnTouchListener(new View.OnTouchListener() {
@@ -105,6 +135,7 @@ public final class OverlayService extends Service {
             private int startX, startY;
             private boolean moved;
             @Override public boolean onTouch(View view, MotionEvent event) {
+                if (bubble != view || position == null || windowManager == null) return true;
                 if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
                     downX = event.getRawX(); downY = event.getRawY();
                     startX = position.x; startY = position.y; moved = false;
@@ -133,20 +164,31 @@ public final class OverlayService extends Service {
             }
         });
         try { windowManager.addView(bubble, position); }
-        catch (RuntimeException denied) { bubble = null; }
+        catch (RuntimeException denied) {
+            removeBubble();
+            // The accessibility service may disconnect while its window is being added.
+            // A new LayoutParams avoids carrying its old token into the ordinary fallback.
+            if (selectedType == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY && Settings.canDrawOverlays(this))
+                addBubble(applicationWindowManager, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+        }
     }
 
     private void clampPosition() {
         android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
-        position.x = Math.max(0, Math.min(position.x, metrics.widthPixels - dp(50)));
-        position.y = Math.max(dp(24), Math.min(position.y, metrics.heightPixels - dp(74)));
+        position.x = Math.max(0, Math.min(position.x, metrics.widthPixels - position.width));
+        position.y = Math.max(dp(24), Math.min(position.y, metrics.heightPixels - position.height - dp(24)));
     }
 
     private void removeBubble() {
-        if (bubble == null) return;
-        try { windowManager.removeView(bubble); } catch (RuntimeException ignored) { }
+        MonthlyCatView oldBubble = bubble;
+        WindowManager oldManager = windowManager;
         bubble = null;
+        position = null;
+        windowManager = null;
+        if (oldBubble != null && oldManager != null) {
+            try { oldManager.removeViewImmediate(oldBubble); } catch (RuntimeException ignored) { }
+        }
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }

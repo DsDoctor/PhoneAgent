@@ -11,6 +11,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import org.json.JSONArray;
@@ -24,15 +25,36 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     private static volatile PhoneAccessibilityService connected;
     private final Handler main = new Handler(Looper.getMainLooper());
 
-    @Override protected void onServiceConnected() { connected = this; }
+    @Override protected void onServiceConnected() {
+        super.onServiceConnected();
+        connected = this;
+        OverlayService.onAccessibilityConnectionChanged();
+    }
     @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
     @Override public void onInterrupt() { }
+    @Override public boolean onUnbind(Intent intent) {
+        disconnectOverlay();
+        return super.onUnbind(intent);
+    }
     @Override public void onDestroy() {
-        if (connected == this) connected = null;
+        disconnectOverlay();
         super.onDestroy();
     }
 
     public static boolean isEnabled() { return connected != null; }
+
+    /** Main-thread only: this service's WindowManager carries its accessibility token. */
+    static WindowManager overlayWindowManager() {
+        PhoneAccessibilityService service = connected;
+        return service == null ? null : (WindowManager) service.getSystemService(WINDOW_SERVICE);
+    }
+
+    private void disconnectOverlay() {
+        // A stale instance must not disconnect a newer service instance.
+        if (connected != this) return;
+        connected = null;
+        OverlayService.onAccessibilityConnectionChanged();
+    }
 
     /** Call from a worker thread; gesture results reflect the system callback. */
     public static JSONObject execute(String tool, JSONObject arguments) {

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive foreground bounds include the launcher's overscan area. Fractional
+     insets scale with those bounds, unlike a fixed-size layer-list item. The
+     content rectangle follows the original 192:208 frame aspect ratio and keeps
+     the complete cat inside the adaptive icon's central safe area. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="22.3%" android:insetRight="22.3%"
+    android:insetTop="20%" android:insetBottom="20%">
+    <bitmap android:src="@drawable/monthly_cat_icon"
+        android:gravity="fill" android:filter="true" />
+</inset>

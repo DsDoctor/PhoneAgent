@@ -11,7 +11,10 @@ import java.util.Set;
 
 /** A per-task authenticated loopback bridge. Never listens on the LAN. */
 final class PhoneToolServer implements Closeable {
-    interface Observer { void onTool(String name); }
+    interface Observer {
+        void onTool(String name);
+        default void onToolFinished(String name) { }
+    }
     private static final Set<String> TOOLS = new HashSet<>(Arrays.asList(
         "read_screen", "home", "back", "open_settings", "open_app", "tap", "swipe", "type_text"));
     private final ServerSocket server;
@@ -102,12 +105,16 @@ final class PhoneToolServer implements Closeable {
             return;
         }
         if (closed) return;
-        observer.onTool(name);
-        JSONObject args = body.optJSONObject("arguments");
-        JSONObject result;
-        try { result = PhoneAccessibilityService.execute(name, args == null ? new JSONObject() : args); }
-        catch (Exception ex) { result = new JSONObject().put("ok", false).put("error", ex.getMessage()); }
-        respond(socket, 200, result);
+        try {
+            observer.onTool(name);
+            JSONObject args = body.optJSONObject("arguments");
+            JSONObject result;
+            try { result = PhoneAccessibilityService.execute(name, args == null ? new JSONObject() : args); }
+            catch (Exception ex) { result = new JSONObject().put("ok", false).put("error", ex.getMessage()); }
+            respond(socket, 200, result);
+        } finally {
+            observer.onToolFinished(name);
+        }
     }
 
     private static void respond(Socket socket, int code, JSONObject result) throws IOException {

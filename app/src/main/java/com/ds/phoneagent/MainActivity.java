@@ -43,7 +43,7 @@ public final class MainActivity extends Activity {
     private Button send, stop, prepare, control, bubble;
     private LinearLayout modelFields;
     private ScrollView contentScroll;
-    private boolean suppressBubbleOnPause;
+    private MonthlyCatView statePet;
 
     private final AgentController.Listener listener = new AgentController.Listener() {
         @Override public void onStatus(String text) {
@@ -59,6 +59,9 @@ public final class MainActivity extends Activity {
                 state.setText(message);
                 refreshState();
             });
+        }
+        @Override public void onVisualState(AgentController.VisualState value) {
+            runOnUiThread(() -> statePet.setState(value));
         }
     };
 
@@ -77,14 +80,13 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        suppressBubbleOnPause = false;
         OverlayService.setActivityVisible(true);
         OverlayService.start(this, "");
         refreshState();
     }
 
     @Override protected void onPause() {
-        if (!suppressBubbleOnPause) OverlayService.setActivityVisible(false);
+        OverlayService.setActivityVisible(false);
         super.onPause();
     }
 
@@ -105,7 +107,7 @@ public final class MainActivity extends Activity {
         TextView title = text("PhoneAgent", 28, INK);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         page.addView(title);
-        TextView subtitle = text("说清任务，让手机动手", 14, MUTED);
+        TextView subtitle = text("月薪喵 · 让手机替你动手", 14, MUTED);
         subtitle.setPadding(0, dp(4), 0, dp(16));
         page.addView(subtitle);
 
@@ -117,9 +119,17 @@ public final class MainActivity extends Activity {
         contentScroll.addView(content);
 
         LinearLayout setup = card();
+        LinearLayout statusRow = horizontal();
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        statePet = new MonthlyCatView(this);
+        statePet.setState(controller.getVisualState());
+        LinearLayout.LayoutParams petSize = new LinearLayout.LayoutParams(dp(72), dp(84));
+        petSize.rightMargin = dp(12);
+        statusRow.addView(statePet, petSize);
         state = text("先准备环境，再开启手机控制", 15, INK);
         state.setTypeface(Typeface.DEFAULT_BOLD);
-        setup.addView(state);
+        statusRow.addView(state, new LinearLayout.LayoutParams(0, -2, 1));
+        setup.addView(statusRow);
         capabilities = text("", 12, MUTED);
         capabilities.setPadding(0, dp(7), 0, dp(8));
         setup.addView(capabilities);
@@ -139,12 +149,10 @@ public final class MainActivity extends Activity {
             refreshState();
         });
         control.setOnClickListener(view -> {
-            suppressBubbleOnPause = true;
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
         });
         bubble.setOnClickListener(view -> {
-            if (!Settings.canDrawOverlays(this)) {
-                suppressBubbleOnPause = true;
+            if (!Settings.canDrawOverlays(this) && !PhoneAccessibilityService.isEnabled()) {
                 startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
             } else {
                 boolean enabled = preferences.getBoolean("bubble_enabled", true);
@@ -256,10 +264,10 @@ public final class MainActivity extends Activity {
         boolean running = controller.isRunning();
         boolean ready = controller.isReady();
         boolean accessible = PhoneAccessibilityService.isEnabled();
-        boolean overlay = Settings.canDrawOverlays(this);
+        boolean overlay = Settings.canDrawOverlays(this) || accessible;
         capabilities.setText((ready ? "环境已就绪" : "环境待准备") + "  ·  "
                 + (accessible ? "手机控制已开启" : "手机控制未开启") + "  ·  "
-                + (overlay ? "悬浮权限已开启" : "悬浮权限未开启"));
+                + (overlay ? "悬浮球可用" : "悬浮球待授权"));
         prepare.setText(ready ? "环境已就绪" : "准备环境");
         prepare.setEnabled(!running && !ready);
         control.setText(accessible ? "手机控制设置" : "开启手机控制");

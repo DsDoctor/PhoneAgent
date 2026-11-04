@@ -4,6 +4,8 @@ This separate test APK uses Android's built-in `Instrumentation` API. It adds no
 
 Each test opens MainActivity, starts the app's foreground service and holds a bounded partial wake lock until cleanup. Runtime preparation therefore begins while the app is visible. Tools and loop tests bring other apps to the foreground; Huawei may still require allowing PhoneAgent to run in the background under its battery/app-launch settings. A partial wake lock alone is not a guarantee against vendor process freezing.
 
+The startup intent uses `NEW_TASK | CLEAR_TOP | SINGLE_TOP`, then checks that MainActivity is resumed, visible and focused before announcing test readiness. The runner's cleanup launch also clears activities above MainActivity; merely bringing an existing task forward could otherwise return to a system settings activity left at the top of that task.
+
 ```bash
 python3 scripts/build_android_tests.py
 adb install -r build/android-tests/PhoneAgent-tests.apk
@@ -54,6 +56,19 @@ python3 scripts/test-device.py controller
 ```
 
 As with `loop`, this validates integration and lifecycle handling, not a real external model.
+
+The controller test also requires visual-state callbacks in the order `THINKING → ACTING → THINKING → SUCCESS` for the fixture task and `THINKING → STOPPING → STOPPED` for cancellation. Repeated states and additional tool rounds are allowed. It checks the final state exposed by `getVisualState()` rather than simulating or writing Controller state.
+
+## Overlay and cat animation
+
+`overlay` verifies that the bubble is hidden inside MainActivity, attached using `TYPE_ACCESSIBILITY_OVERLAY` on Home and Settings, and returns to the app when tapped. It then invokes the real phone-control button listener and goes directly Home from accessibility settings, exercising the previous stale-visibility regression. The Settings bubble is tapped with a real accessibility gesture; the control-button listener is invoked on the UI thread to avoid unrelated return-animation hit testing. Attached/view visibility alone does not prove compositor visibility; inspect the actual Settings window or `dumpsys window` as well.
+
+`pet` uses the real `MonthlyCatView` on Home. It sets each view state, checks the getter, observes frame advancement for THINKING and ACTING, and restores the original view state. It then tests MainActivity's actual state cat with deterministic `ScrollView.scrollTo` calls: frames pause when fully clipped and resume after scrolling back, without calling `setState` to restart them. If the current content is too short, the test temporarily adds blank space via the content view's minimum height, then restores that height, scroll position and original view state. It never changes Controller state, edits user fields, reads model credentials or starts a model request.
+
+```bash
+python3 scripts/test-device.py overlay
+python3 scripts/test-device.py pet
+```
 
 Success ends with `result=PASS` and `INSTRUMENTATION_CODE: -1`. Failure reports an assertion/exception and `result=FAIL`. Inspect the result text; `adb shell` itself can return exit code 0 even when an instrumentation test failed.
 

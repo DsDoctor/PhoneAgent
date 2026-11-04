@@ -13,10 +13,12 @@ import java.util.concurrent.*;
 
 /** Owns one task at a time; the actual agent loop belongs to Claude Code. */
 public final class AgentController {
+    public enum VisualState { IDLE, PREPARING, THINKING, ACTING, SUCCESS, NEEDS_INPUT, ERROR, STOPPING, STOPPED }
     public interface Listener {
         void onStatus(String status);
         void onOutput(String output);
         void onFinished(boolean success, String message);
+        default void onVisualState(VisualState state) { }
     }
     private static AgentController instance;
     public static synchronized AgentController get(Context context) {
@@ -32,6 +34,7 @@ public final class AgentController {
     private volatile Process process;
     private volatile PhoneToolServer bridge;
     private volatile boolean running, cancelled;
+    private volatile VisualState visualState = VisualState.IDLE;
     private String lastStatus = "先准备运行环境，再配置模型和手机权限。";
     private String lastOutput = "";
 
@@ -39,14 +42,37 @@ public final class AgentController {
         this.context = context;
         runtime = new LinuxRuntime(context);
         if (runtime.isInstalled()) lastStatus = "运行环境已就绪，连接模型后即可执行。";
+        else visualState = VisualState.NEEDS_INPUT;
     }
     public void setListener(Listener listener) {
         this.listener = listener;
-        main.post(() -> { if (this.listener == listener) { listener.onStatus(lastStatus); listener.onOutput(lastOutput); } });
+        main.post(() -> { if (this.listener == listener) {
+            listener.onStatus(lastStatus); listener.onOutput(lastOutput); listener.onVisualState(visualState);
+        } });
     }
     public void removeListener(Listener listener) { if (this.listener == listener) this.listener = null; }
     public boolean isRunning() { return running; }
     public boolean isReady() { return runtime.isInstalled(); }
+    public VisualState getVisualState() { return visualState; }
+    private void setVisualState(VisualState value) {
+        main.post(() -> publishVisualState(value));
+    }
+    private void publishVisualState(VisualState value) {
+        visualState = value;
+        OverlayService.setPetState(value);
+        Listener l = listener;
+        if (l != null) l.onVisualState(value);
+    }
+    private void toolState(VisualState value, String message) {
+        main.post(() -> {
+            // A delayed tool callback must not replace a stop or terminal state.
+            if (!running || cancelled) return;
+            publishVisualState(value);
+            lastStatus = message;
+            Listener l = listener;
+            if (l != null) l.onStatus(message);
+        });
+    }
     private void status(String value) {
         main.post(() -> { lastStatus = value; Listener l = listener; if (l != null) l.onStatus(value); });
     }
@@ -55,6 +81,10 @@ public final class AgentController {
     }
     private void finished(boolean ok, String message) {
         main.post(() -> { lastStatus = message; Listener l = listener; if (l != null) { l.onStatus(message); l.onFinished(ok, message); } });
+    }
+    private void needsInput(String message) {
+        setVisualState(VisualState.NEEDS_INPUT);
+        finished(false, message);
     }
     private synchronized boolean begin() {
         if (running) { status("已有任务在运行，请先停止或等待完成。"); return false; }
@@ -70,6 +100,7 @@ public final class AgentController {
     }
     public void installRuntime() {
         if (!begin()) return;
+        setVisualState(VisualState.PREPARING);
         worker.execute(() -> {
             PowerManager.WakeLock lock = wakeLock();
             boolean ok = false;
@@ -86,21 +117,23 @@ public final class AgentController {
                 message = "运行环境就绪 · " + version.trim();
             } catch (Exception e) { message = cancelled ? "已停止准备。" : "准备失败：" + safeMessage(e); }
             finally { if (lock.isHeld()) lock.release(); running = false; }
+            setVisualState(cancelled ? VisualState.STOPPED : ok ? VisualState.IDLE : VisualState.ERROR);
             finished(ok, message);
         });
     }
     public void run(String prompt, String baseUrl, String model, String apiKey) {
-        if (prompt == null || prompt.trim().isEmpty()) { finished(false, "先输入要手机完成的事情。"); return; }
-        if (!isReady()) { finished(false, "请先准备运行环境。"); return; }
-        if (!PhoneAccessibilityService.isEnabled()) { finished(false, "请先在系统设置中开启 PhoneAgent 无障碍服务。"); return; }
+        if (prompt == null || prompt.trim().isEmpty()) { needsInput("先输入要手机完成的事情。"); return; }
+        if (!isReady()) { needsInput("请先准备运行环境。"); return; }
+        if (!PhoneAccessibilityService.isEnabled()) { needsInput("请先在系统设置中开启 PhoneAgent 无障碍服务。"); return; }
         try {
             URI url = new URI(baseUrl.trim());
             boolean local = "127.0.0.1".equals(url.getHost()) || "localhost".equals(url.getHost());
             if (url.getHost() == null || url.getUserInfo() != null || url.getQuery() != null || url.getFragment() != null
                 || !("https".equals(url.getScheme()) || (local && "http".equals(url.getScheme())))) throw new Exception();
-        } catch (Exception e) { finished(false, "请填写兼容 Anthropic API 的 HTTPS 服务地址。"); return; }
-        if (model.trim().isEmpty() || apiKey.trim().isEmpty()) { finished(false, "请先填写模型名和 API Key。"); return; }
+        } catch (Exception e) { needsInput("请填写兼容 Anthropic API 的 HTTPS 服务地址。"); return; }
+        if (model.trim().isEmpty() || apiKey.trim().isEmpty()) { needsInput("请先填写模型名和 API Key。"); return; }
         if (!begin()) return;
+        setVisualState(VisualState.THINKING);
         output("");
         worker.execute(() -> runTask(prompt.trim(), baseUrl.trim(), model.trim(), apiKey.trim()));
     }
@@ -112,7 +145,14 @@ public final class AgentController {
         String message = "任务未完成。";
         ScheduledFuture<?> deadline = timer.schedule(this::stop, 5, TimeUnit.MINUTES);
         try {
-            bridge = new PhoneToolServer(name -> status("正在操作手机：" + toolLabel(name)));
+            bridge = new PhoneToolServer(new PhoneToolServer.Observer() {
+                @Override public void onTool(String name) {
+                    toolState(VisualState.ACTING, "正在操作手机：" + toolLabel(name));
+                }
+                @Override public void onToolFinished(String name) {
+                    toolState(VisualState.THINKING, "正在思考下一步…");
+                }
+            });
             if (cancelled) throw new CancellationException();
             status("正在连接模型…");
             process = runtime.startClaude(prompt, baseUrl, model, apiKey, bridge.port(), bridge.token());
@@ -158,6 +198,7 @@ public final class AgentController {
             running = false;
         }
         if (cancelled) { ok = false; message = "已停止任务（单次任务最长 5 分钟）。"; }
+        setVisualState(cancelled ? VisualState.STOPPED : ok ? VisualState.SUCCESS : VisualState.ERROR);
         finished(ok, message);
     }
 
@@ -170,6 +211,7 @@ public final class AgentController {
     }
     public void stop() {
         if (!running) return;
+        setVisualState(VisualState.STOPPING);
         cancelled = true;
         runtime.cancel();
         PhoneToolServer server = bridge; if (server != null) server.close();

@@ -5,11 +5,16 @@ import android.app.Instrumentation;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ResolveInfo;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.ScrollView;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import java.io.*;
@@ -29,6 +34,21 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class TestInstrumentation extends Instrumentation {
     private String mode;
     private final StringBuilder report = new StringBuilder();
+    private volatile MainActivity resumedMain;
+    private volatile boolean mainResumed;
+
+    @Override public void callActivityOnResume(Activity activity) {
+        super.callActivityOnResume(activity);
+        if (activity instanceof MainActivity) {
+            resumedMain = (MainActivity) activity;
+            mainResumed = true;
+        }
+    }
+
+    @Override public void callActivityOnPause(Activity activity) {
+        if (activity == resumedMain) mainResumed = false;
+        super.callActivityOnPause(activity);
+    }
 
     @Override public void onCreate(Bundle arguments) {
         mode = arguments == null ? "tools" : arguments.getString("mode", "tools");
@@ -47,17 +67,19 @@ public final class TestInstrumentation extends Instrumentation {
             wakeLock.acquire(15 * 60 * 1000L);
             runOnMainSync(() -> {
                 target.startActivity(new Intent(target, MainActivity.class)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP));
                 target.startForegroundService(new Intent(target, OverlayService.class));
             });
             waitForIdleSync();
-            SystemClock.sleep(400);
+            waitForMainActivityVisible();
             log("Test started with MainActivity visible, foreground service and partial wake lock");
             if ("runtime".equals(mode)) runtime();
             else if ("tools".equals(mode)) tools();
             else if ("loop".equals(mode)) loop();
             else if ("controller".equals(mode)) controller();
             else if ("input".equals(mode)) input();
+            else if ("overlay".equals(mode)) overlay();
+            else if ("pet".equals(mode)) pet();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -72,6 +94,23 @@ public final class TestInstrumentation extends Instrumentation {
             if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         }
         finish(resultCode, result);
+    }
+
+    private void waitForMainActivityVisible() {
+        long deadline = SystemClock.uptimeMillis() + 10000;
+        AtomicBoolean visible = new AtomicBoolean();
+        while (SystemClock.uptimeMillis() < deadline) {
+            runOnMainSync(() -> {
+                MainActivity activity = resumedMain;
+                View decor = activity == null || activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+                visible.set(mainResumed && activity != null && !activity.isFinishing() && !activity.isDestroyed()
+                        && decor != null && decor.isShown() && decor.getWindowVisibility() == View.VISIBLE
+                        && activity.hasWindowFocus());
+            });
+            if (visible.get()) return;
+            SystemClock.sleep(100);
+        }
+        throw new AssertionError("MainActivity did not become resumed, visible and focused after CLEAR_TOP launch");
     }
 
     private void runtime() throws Exception {
@@ -232,6 +271,11 @@ public final class TestInstrumentation extends Instrumentation {
             check(completed.output.get().contains("本地联调完成"), "Controller did not publish the parsed assistant output: " + completed.output.get());
             check(!controller.isRunning(), "Controller remained running after success callback");
             check(processField.get(controller) == null, "Controller retained a completed process");
+            check(controller.getVisualState() == AgentController.VisualState.SUCCESS,
+                    "Controller did not publish SUCCESS visual state: " + controller.getVisualState());
+            assertStatesInOrder(completed, AgentController.VisualState.THINKING,
+                    AgentController.VisualState.ACTING, AgentController.VisualState.THINKING,
+                    AgentController.VisualState.SUCCESS);
             // Use an independent bridge only to verify the displayed package; it does
             // not participate in the Controller's model-driven execution.
             try (PhoneToolServer verification = new PhoneToolServer(name -> { })) {
@@ -257,6 +301,10 @@ public final class TestInstrumentation extends Instrumentation {
             check(stopped.message.get().contains("已停止"), "Stop callback did not report cancellation: " + stopped.message.get());
             check(!controller.isRunning(), "Controller remained running after Stop");
             check(processField.get(controller) == null, "Controller retained its process after Stop");
+            check(controller.getVisualState() == AgentController.VisualState.STOPPED,
+                    "Controller did not publish STOPPED visual state: " + controller.getVisualState());
+            assertStatesInOrder(stopped, AgentController.VisualState.THINKING,
+                    AgentController.VisualState.STOPPING, AgentController.VisualState.STOPPED);
             log("Controller Stop callback, running flag and process cleanup verified");
         } finally {
             runOnMainSync(() -> {
@@ -325,7 +373,8 @@ public final class TestInstrumentation extends Instrumentation {
             // If no IME was shown, Back can leave the activity. Bring our own app
             // back before selecting a swipe region; never swipe another app.
             runOnMainSync(() -> getTargetContext().startActivity(new Intent(getTargetContext(), MainActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
+            waitForMainActivityVisible();
             screen = waitForPackage(bridge, getTargetContext().getPackageName());
             JSONArray scrollBounds = null;
             int largestArea = 0;
@@ -356,6 +405,294 @@ public final class TestInstrumentation extends Instrumentation {
             if (node.optBoolean("editable") && text.equals(node.optString("text"))) return true;
         }
         return false;
+    }
+
+    /** Regression test for Huawei hiding ordinary overlays over system settings. */
+    private void overlay() throws Exception {
+        long serviceDeadline = SystemClock.uptimeMillis() + 15000;
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Enable PhoneAgent accessibility before overlay test");
+        check(!AgentController.get(getTargetContext()).isRunning(), "Do not run overlay tests during an active task");
+        try (PhoneToolServer bridge = new PhoneToolServer(name -> { })) {
+            waitForPackage(bridge, getTargetContext().getPackageName());
+            waitForBubble(false, "MainActivity");
+            log("Bubble hidden while MainActivity is visible");
+
+            call(bridge, "home");
+            String homePackage = resolve(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME));
+            waitForPackage(bridge, homePackage);
+            waitForBubble(true, "Home");
+            log("Home bubble is attached as TYPE_ACCESSIBILITY_OVERLAY");
+
+            call(bridge, "open_settings");
+            waitForPackage(bridge, resolve(new Intent(Settings.ACTION_SETTINGS)));
+            BubbleState settingsBubble = waitForBubble(true, "System settings");
+            log("Settings bubble is attached as TYPE_ACCESSIBILITY_OVERLAY; compositor visibility needs external verification");
+            call(bridge, "tap", new JSONObject().put("x", settingsBubble.centerX).put("y", settingsBubble.centerY));
+            waitForPackage(bridge, getTargetContext().getPackageName());
+            waitForBubble(false, "MainActivity after bubble tap");
+            log("Real tap on Settings bubble returned to MainActivity and hid the bubble");
+
+            waitForIdleSync();
+            SystemClock.sleep(350);
+            clickControlSettings();
+            waitForPackage(bridge, resolve(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+            // Go directly Home, without resuming MainActivity, to reproduce the
+            // stale activityVisible/suppressBubbleOnPause regression.
+            call(bridge, "home");
+            waitForPackage(bridge, homePackage);
+            waitForBubble(true, "Home after accessibility settings");
+            log("Bubble remains attached after control-settings -> direct Home; no model or settings values changed");
+        }
+    }
+
+    private BubbleState waitForBubble(boolean attached, String stage) throws Exception {
+        long deadline = SystemClock.uptimeMillis() + 3000;
+        BubbleState state = null;
+        while (SystemClock.uptimeMillis() < deadline) {
+            state = bubbleState();
+            if (!attached && !state.attached) return state;
+            if (attached && state.attached && state.shown && state.width > 0 && state.height > 0
+                    && state.type == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) return state;
+            SystemClock.sleep(150);
+        }
+        throw new AssertionError(stage + ": expected bubble attached=" + attached
+                + (attached ? " with accessibility overlay type" : "") + ", got " + state);
+    }
+
+    /** Animate the real overlay view without running a model or changing Controller state. */
+    private void pet() throws Exception {
+        long serviceDeadline = SystemClock.uptimeMillis() + 15000;
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Enable PhoneAgent accessibility before pet test");
+        check(!AgentController.get(getTargetContext()).isRunning(), "Do not run pet view tests during an active task");
+        try (PhoneToolServer bridge = new PhoneToolServer(name -> { })) {
+            call(bridge, "home");
+            waitForPackage(bridge, resolve(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)));
+            waitForBubble(true, "Pet on Home");
+            AtomicReference<MonthlyCatView> reference = new AtomicReference<>();
+            AtomicReference<Exception> failure = new AtomicReference<>();
+            runOnMainSync(() -> {
+                try {
+                    Field instance = OverlayService.class.getDeclaredField("instance");
+                    Field bubble = OverlayService.class.getDeclaredField("bubble");
+                    instance.setAccessible(true); bubble.setAccessible(true);
+                    Object view = bubble.get(instance.get(null));
+                    if (!(view instanceof MonthlyCatView)) throw new IllegalStateException("Overlay is not a MonthlyCatView");
+                    reference.set((MonthlyCatView) view);
+                } catch (Exception error) { failure.set(error); }
+            });
+            if (failure.get() != null) throw failure.get();
+            MonthlyCatView cat = reference.get();
+            AtomicReference<AgentController.VisualState> original = new AtomicReference<>();
+            runOnMainSync(() -> original.set(cat.getState()));
+            AgentController.VisualState controllerBefore = AgentController.get(getTargetContext()).getVisualState();
+            try {
+                for (AgentController.VisualState state : AgentController.VisualState.values()) {
+                    AtomicReference<AgentController.VisualState> observed = new AtomicReference<>();
+                    AtomicInteger frame = new AtomicInteger(-1);
+                    runOnMainSync(() -> {
+                        cat.setState(state);
+                        observed.set(cat.getState());
+                        frame.set(cat.getFrameIndex());
+                    });
+                    check(observed.get() == state, "Pet view did not accept " + state);
+                    check(frame.get() >= 0, "Pet view has invalid frame index for " + state);
+                }
+                log("MonthlyCatView accepts every VisualState");
+                runOnMainSync(() -> cat.setState(AgentController.VisualState.THINKING));
+                assertFramesAdvance(cat, "THINKING");
+                runOnMainSync(() -> cat.setState(AgentController.VisualState.ACTING));
+                assertFramesAdvance(cat, "ACTING");
+                check(AgentController.get(getTargetContext()).getVisualState() == controllerBefore,
+                        "Direct pet view test unexpectedly changed Controller state");
+                log("Pet animation checked without a model call or any model-configuration access");
+            } finally {
+                runOnMainSync(() -> cat.setState(original.get()));
+            }
+            testMainPetScroll(bridge);
+        }
+    }
+
+    private void testMainPetScroll(PhoneToolServer bridge) throws Exception {
+        runOnMainSync(() -> getTargetContext().startActivity(new Intent(getTargetContext(), MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
+        waitForMainActivityVisible();
+        waitForPackage(bridge, getTargetContext().getPackageName());
+        waitForIdleSync();
+        SystemClock.sleep(350);
+        AtomicReference<MainPetFixture> reference = new AtomicReference<>();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try {
+                MainActivity activity = resumedMain;
+                if (activity == null) throw new IllegalStateException("No resumed MainActivity for scrolling test");
+                Field petField = MainActivity.class.getDeclaredField("statePet");
+                Field scrollField = MainActivity.class.getDeclaredField("contentScroll");
+                petField.setAccessible(true); scrollField.setAccessible(true);
+                MainPetFixture fixture = new MainPetFixture();
+                fixture.pet = (MonthlyCatView) petField.get(activity);
+                fixture.scroll = (ScrollView) scrollField.get(activity);
+                fixture.content = fixture.scroll.getChildAt(0);
+                fixture.minimumHeight = fixture.content.getMinimumHeight();
+                fixture.scrollY = fixture.scroll.getScrollY();
+                fixture.state = fixture.pet.getState();
+                reference.set(fixture);
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        MainPetFixture fixture = reference.get();
+        try {
+            runOnMainSync(() -> {
+                fixture.pet.setState(AgentController.VisualState.THINKING);
+                fixture.scroll.scrollTo(0, 0);
+                Rect bounds = new Rect(0, 0, fixture.pet.getWidth(), fixture.pet.getHeight());
+                ((ViewGroup) fixture.content).offsetDescendantRectToMyCoords(fixture.pet, bounds);
+                fixture.hiddenScrollY = bounds.bottom + 32;
+                int viewport = fixture.scroll.getHeight() - fixture.scroll.getPaddingTop() - fixture.scroll.getPaddingBottom();
+                fixture.requiredContentHeight = viewport + fixture.hiddenScrollY;
+                // Add only temporary blank scroll space when the current screen's
+                // content is too short; do not alter any text, fields or preferences.
+                fixture.content.setMinimumHeight(Math.max(fixture.minimumHeight, fixture.requiredContentHeight));
+            });
+            long layoutDeadline = SystemClock.uptimeMillis() + 2000;
+            AtomicInteger height = new AtomicInteger();
+            do {
+                runOnMainSync(() -> height.set(fixture.content.getHeight()));
+                if (height.get() >= fixture.requiredContentHeight) break;
+                SystemClock.sleep(50);
+            } while (SystemClock.uptimeMillis() < layoutDeadline);
+            check(height.get() >= fixture.requiredContentHeight, "Scroll fixture did not finish layout");
+            waitForPetVisibility(fixture.pet, true);
+            assertFramesAdvance(fixture.pet, "MainActivity THINKING before scroll");
+            runOnMainSync(() -> fixture.scroll.scrollTo(0, fixture.hiddenScrollY));
+            waitForPetVisibility(fixture.pet, false);
+            AtomicInteger hiddenFrame = new AtomicInteger();
+            AtomicInteger laterFrame = new AtomicInteger();
+            runOnMainSync(() -> hiddenFrame.set(fixture.pet.getFrameIndex()));
+            SystemClock.sleep(400);
+            runOnMainSync(() -> laterFrame.set(fixture.pet.getFrameIndex()));
+            check(hiddenFrame.get() == laterFrame.get(), "Offscreen state cat kept advancing frames");
+            runOnMainSync(() -> fixture.scroll.scrollTo(0, 0));
+            waitForPetVisibility(fixture.pet, true);
+            // Do not call setState/invalidate here: normal scrolling and drawing
+            // must restart animation by themselves.
+            assertFramesAdvance(fixture.pet, "MainActivity THINKING after scroll return");
+            log("Actual MainActivity state cat resumes after scrolling out and back into view");
+        } finally {
+            runOnMainSync(() -> {
+                fixture.pet.setState(fixture.state);
+                fixture.content.setMinimumHeight(fixture.minimumHeight);
+                fixture.scroll.scrollTo(0, fixture.scrollY);
+            });
+        }
+    }
+
+    private void waitForPetVisibility(MonthlyCatView cat, boolean expected) {
+        long deadline = SystemClock.uptimeMillis() + 2000;
+        AtomicBoolean visible = new AtomicBoolean();
+        while (SystemClock.uptimeMillis() < deadline) {
+            runOnMainSync(() -> visible.set(cat.isShown() && cat.getGlobalVisibleRect(new Rect())));
+            if (visible.get() == expected) return;
+            SystemClock.sleep(60);
+        }
+        throw new AssertionError("MainActivity state cat visibility did not become " + expected);
+    }
+
+    private static final class MainPetFixture {
+        MonthlyCatView pet;
+        ScrollView scroll;
+        View content;
+        AgentController.VisualState state;
+        int minimumHeight, scrollY, hiddenScrollY, requiredContentHeight;
+    }
+
+    private void assertFramesAdvance(MonthlyCatView cat, String label) {
+        AtomicInteger frame = new AtomicInteger();
+        runOnMainSync(() -> frame.set(cat.getFrameIndex()));
+        int initial = frame.get();
+        long deadline = SystemClock.uptimeMillis() + 1800;
+        while (SystemClock.uptimeMillis() < deadline) {
+            SystemClock.sleep(60);
+            runOnMainSync(() -> frame.set(cat.getFrameIndex()));
+            if (frame.get() != initial) {
+                log(label + " pet animation advanced from frame " + initial + " to " + frame.get());
+                return;
+            }
+        }
+        throw new AssertionError(label + " pet animation did not advance while attached and visible");
+    }
+
+    private static void assertStatesInOrder(ControllerProbe probe, AgentController.VisualState... expected) {
+        int matched = 0;
+        for (AgentController.VisualState state : probe.states)
+            if (matched < expected.length && expected[matched] == state) matched++;
+        check(matched == expected.length, "Controller visual-state callbacks missing/out of order: " + probe.states);
+    }
+
+    private BubbleState bubbleState() throws Exception {
+        AtomicReference<BubbleState> result = new AtomicReference<>();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try {
+                Field instanceField = OverlayService.class.getDeclaredField("instance");
+                Field bubbleField = OverlayService.class.getDeclaredField("bubble");
+                Field positionField = OverlayService.class.getDeclaredField("position");
+                instanceField.setAccessible(true); bubbleField.setAccessible(true); positionField.setAccessible(true);
+                Object service = instanceField.get(null);
+                View bubble = service == null ? null : (View) bubbleField.get(service);
+                WindowManager.LayoutParams position = service == null ? null
+                        : (WindowManager.LayoutParams) positionField.get(service);
+                BubbleState state = new BubbleState();
+                if (bubble != null) {
+                    state.attached = bubble.isAttachedToWindow();
+                    state.shown = bubble.isShown();
+                    state.width = bubble.getWidth(); state.height = bubble.getHeight();
+                    int[] location = new int[2]; bubble.getLocationOnScreen(location);
+                    state.centerX = location[0] + state.width / 2;
+                    state.centerY = location[1] + state.height / 2;
+                    if (bubble.getLayoutParams() instanceof WindowManager.LayoutParams)
+                        state.type = ((WindowManager.LayoutParams) bubble.getLayoutParams()).type;
+                    else if (position != null) state.type = position.type;
+                }
+                result.set(state);
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        return result.get();
+    }
+
+    private void clickControlSettings() throws Exception {
+        AtomicBoolean clicked = new AtomicBoolean();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try {
+                MainActivity activity = resumedMain;
+                if (activity == null) throw new IllegalStateException("No resumed MainActivity for control-button test");
+                Field field = MainActivity.class.getDeclaredField("control");
+                field.setAccessible(true);
+                View control = (View) field.get(activity);
+                if (control == null || !control.isEnabled())
+                    throw new IllegalStateException("Phone-control settings button is not enabled");
+                // This stage tests the settings-navigation/onPause regression, not
+                // hit testing during the activity's return animation. Invoke the
+                // actual button listener on the main thread deterministically.
+                clicked.set(control.performClick());
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        check(clicked.get(), "Phone-control settings button did not handle its click");
+    }
+
+    private static final class BubbleState {
+        boolean attached, shown;
+        int type = -1, centerX, centerY, width, height;
+        @Override public String toString() {
+            return "attached=" + attached + ", shown=" + shown + ", type=" + type
+                    + ", size=" + width + "x" + height;
+        }
     }
 
     private static boolean hasFocusedText(JSONObject screen, String text) throws Exception {
@@ -471,6 +808,8 @@ public final class TestInstrumentation extends Instrumentation {
         final AtomicReference<String> status = new AtomicReference<>("");
         final AtomicReference<String> output = new AtomicReference<>("");
         final AtomicReference<String> message = new AtomicReference<>("");
+        final List<AgentController.VisualState> states = new CopyOnWriteArrayList<>();
+        @Override public void onVisualState(AgentController.VisualState state) { states.add(state); }
         @Override public void onStatus(String value) { status.set(value); }
         @Override public void onOutput(String value) { output.set(value); }
         @Override public void onFinished(boolean ok, String value) {

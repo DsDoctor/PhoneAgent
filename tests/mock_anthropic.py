@@ -12,7 +12,9 @@ import time
 from urllib.parse import urlsplit
 
 SEQUENCE = ("home", "read_screen", "open_settings", "read_screen")
+READY_SEQUENCE = ("home", "read_screen", "open_app_ready", "read_screen")
 TEST_MODEL = "phoneagent-smoke-model"
+READY_MODEL = "phoneagent-smoke-ready"
 TEST_KEY = "local-test-only"
 
 
@@ -30,20 +32,23 @@ def make_response(request):
     errors = [result for result in results if result.get("is_error")]
     if errors:
         raise ValueError("The preceding phone tool returned an error; refusing a false success")
-    if step < len(SEQUENCE):
-        operation = SEQUENCE[step]
+    sequence = READY_SEQUENCE if request.get("model") == READY_MODEL else SEQUENCE
+    if step < len(sequence):
+        operation = sequence[step]
         candidates = [tool.get("name") for tool in request.get("tools", [])
                       if isinstance(tool, dict) and isinstance(tool.get("name"), str)
                       and (tool["name"] == operation or tool["name"].endswith("__" + operation))]
         if len(candidates) != 1:
             names = [tool.get("name") for tool in request.get("tools", []) if isinstance(tool, dict)]
             raise ValueError(f"Expected one MCP {operation} tool; advertised names: {names}")
-        block = {"type": "tool_use", "id": f"toolu_local_smoke_{step}", "name": candidates[0], "input": {}}
+        arguments = {"package_name": "com.android.settings", "timeout_ms": 8000} if operation == "open_app_ready" else {}
+        block = {"type": "tool_use", "id": f"toolu_local_smoke_{step}", "name": candidates[0], "input": arguments}
         stop = "tool_use"
     else:
         block = {"type": "text", "text": "本地联调完成：已返回桌面、读取界面、打开设置并再次读取界面。本结果来自固定测试响应，尚未验证真实外部模型。"}
         stop = "end_turn"
-    return {"id": f"msg_local_smoke_{step}", "type": "message", "role": "assistant", "model": TEST_MODEL,
+    return {"id": f"msg_local_smoke_{step}", "type": "message", "role": "assistant",
+            "model": READY_MODEL if request.get("model") == READY_MODEL else TEST_MODEL,
             "content": [block], "stop_reason": stop, "stop_sequence": None,
             "usage": {"input_tokens": 128 + step * 16, "output_tokens": 32}}
 
@@ -107,6 +112,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path != "/v1/messages":
             self.fail(404, "Unsupported fixture endpoint")
+            return
+        if request.get("model") == "phoneagent-smoke-error":
+            print("LOCAL FIXTURE: intentional error for reset regression", flush=True)
+            self.fail(400, "Intentional local fixture failure for reset regression")
             return
         try:
             message = make_response(request)

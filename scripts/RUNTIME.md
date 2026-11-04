@@ -45,3 +45,13 @@ PRoot 和 loader 从 App 的 `nativeLibraryDir` 启动。构建时必须设置 `
 模型密钥仅通过进程环境传入 Claude，不写入 Linux 配置文件，也不放入进程命令行。Claude 内置工具关闭，只允许 `phone` MCP 工具，并以 `dontAsk` 权限模式运行；本实现不使用 `--dangerously-skip-permissions`。手机工具桥接由应用层校验随机令牌。
 
 当前运行时是否能稳定启动，以华为真机上的 `claude --version`、Python MCP 连接和实际任务验证为准；构建成功本身不能证明兼容性。
+
+## 脚本化基础动作
+
+`phone_mcp.py` 提供 `open_app_ready`：启动指定包后，在同一次工具调用中每 500 毫秒读取界面，等待目标包出现可读内容并稳定至少 1 秒。默认等待预算 15 秒，最多 30 秒，HTTP 请求与响应读取也受整体时限约束。这些本地轮询不需要再次请求模型。
+
+已观测到的大麦开屏节点 `splash_layout`、`splash_image`、`homepage_advert_pb` 会阻止就绪判定。工具等待其自然结束，不自动点广告、同意权限或猜测点击坐标；超时返回 `blocked` 和最后界面，连接中断立即停止。`ready` 只表示界面短暂稳定，不代表业务任务完成。
+
+`phone_routines.py` 提供 `list_routines`、`save_routine`、`run_routine`，保存的是受限手机动作 JSON，不执行任意 Shell 或 Python 代码。保存需要真实执行凭据：多步操作需两次完整成功记录；单步 `open_app_ready` 可使用跨任务累计的两次成功候选，再以当前界面验证。脚本执行前检查必要的前台包名，执行后核对最终包名和界面文字，遇到失败立即停止。
+
+脚本和有界的成功候选计数默认保存在手机 Linux 用户的 `~/.phoneagent/routines/`。原始界面与单次执行凭据只在当前 MCP 进程内存中保存；候选计数不保存界面文字、输入内容或模型密钥。测试可通过 `PHONE_AGENT_ROUTINES_DIR` 指向独立目录，无须改变 `HOME` 或访问用户已有脚本。

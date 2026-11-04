@@ -33,7 +33,7 @@ def enable_phone_tools():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("runtime", "tools", "loop", "controller", "input", "overlay", "pet"))
+    parser.add_argument("mode", choices=("runtime", "tools", "loop", "controller", "input", "overlay", "pet", "routines"))
     args = parser.parse_args()
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP", capture=True)
     process = subprocess.Popen(["adb", "shell", "am", "instrument", "-w", "-e", "mode", args.mode,

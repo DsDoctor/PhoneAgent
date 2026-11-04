@@ -10,6 +10,7 @@ import org.json.JSONObject;
 import java.io.*;
 import java.net.URI;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Owns one task at a time; the actual agent loop belongs to Claude Code. */
 public final class AgentController {
@@ -35,6 +36,7 @@ public final class AgentController {
     private volatile PhoneToolServer bridge;
     private volatile boolean running, cancelled;
     private volatile VisualState visualState = VisualState.IDLE;
+    private final AtomicLong presentationEpoch = new AtomicLong();
     private String lastStatus = "先准备运行环境，再配置模型和手机权限。";
     private String lastOutput = "";
 
@@ -54,8 +56,30 @@ public final class AgentController {
     public boolean isRunning() { return running; }
     public boolean isReady() { return runtime.isInstalled(); }
     public VisualState getVisualState() { return visualState; }
+    public boolean canResetToIdle() {
+        if (running) return false;
+        VisualState current = visualState;
+        return current == VisualState.ERROR || current == VisualState.STOPPED
+                || current == VisualState.SUCCESS || current == VisualState.NEEDS_INPUT;
+    }
+    /** Reset presentation only. A running task, its output, and saved settings are untouched. */
+    public void resetToIdle() {
+        main.post(() -> {
+            synchronized (AgentController.this) {
+                // Recheck here rather than relying on an earlier button-state snapshot.
+                if (!canResetToIdle()) return;
+                presentationEpoch.incrementAndGet();
+                boolean ready = runtime.isInstalled();
+                lastStatus = ready ? "已重置为待命，可以开始新任务。" : "运行环境尚未就绪，请先准备运行环境。";
+                publishVisualState(ready ? VisualState.IDLE : VisualState.NEEDS_INPUT);
+                Listener current = listener;
+                if (current != null) current.onStatus(lastStatus);
+            }
+        });
+    }
     private void setVisualState(VisualState value) {
-        main.post(() -> publishVisualState(value));
+        final long epoch = presentationEpoch.get();
+        main.post(() -> { if (epoch == presentationEpoch.get()) publishVisualState(value); });
     }
     private void publishVisualState(VisualState value) {
         visualState = value;
@@ -64,9 +88,10 @@ public final class AgentController {
         if (l != null) l.onVisualState(value);
     }
     private void toolState(VisualState value, String message) {
+        final long epoch = presentationEpoch.get();
         main.post(() -> {
             // A delayed tool callback must not replace a stop or terminal state.
-            if (!running || cancelled) return;
+            if (epoch != presentationEpoch.get() || !running || cancelled) return;
             publishVisualState(value);
             lastStatus = message;
             Listener l = listener;
@@ -74,13 +99,26 @@ public final class AgentController {
         });
     }
     private void status(String value) {
-        main.post(() -> { lastStatus = value; Listener l = listener; if (l != null) l.onStatus(value); });
+        final long epoch = presentationEpoch.get();
+        main.post(() -> {
+            if (epoch != presentationEpoch.get()) return;
+            lastStatus = value; Listener l = listener; if (l != null) l.onStatus(value);
+        });
     }
     private void output(String value) {
-        main.post(() -> { lastOutput = value; Listener l = listener; if (l != null) l.onOutput(value); });
+        final long epoch = presentationEpoch.get();
+        main.post(() -> {
+            if (epoch != presentationEpoch.get()) return;
+            lastOutput = value; Listener l = listener; if (l != null) l.onOutput(value);
+        });
     }
     private void finished(boolean ok, String message) {
-        main.post(() -> { lastStatus = message; Listener l = listener; if (l != null) { l.onStatus(message); l.onFinished(ok, message); } });
+        final long epoch = presentationEpoch.get();
+        main.post(() -> {
+            if (epoch != presentationEpoch.get()) return;
+            lastStatus = message; Listener l = listener;
+            if (l != null) { l.onStatus(message); l.onFinished(ok, message); }
+        });
     }
     private void needsInput(String message) {
         setVisualState(VisualState.NEEDS_INPUT);

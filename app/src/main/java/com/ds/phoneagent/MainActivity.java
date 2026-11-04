@@ -61,7 +61,7 @@ public final class MainActivity extends Activity {
             });
         }
         @Override public void onVisualState(AgentController.VisualState value) {
-            runOnUiThread(() -> statePet.setState(value));
+            runOnUiThread(() -> { statePet.setState(value); refreshState(); });
         }
     };
 
@@ -225,7 +225,11 @@ public final class MainActivity extends Activity {
         page.addView(composer);
         setContentView(page);
         send.setOnClickListener(view -> submit());
-        stop.setOnClickListener(view -> { controller.stop(); refreshState(); });
+        stop.setOnClickListener(view -> {
+            if (controller.isRunning()) controller.stop();
+            else controller.resetToIdle();
+            refreshState();
+        });
     }
 
     private void submit() {
@@ -262,6 +266,7 @@ public final class MainActivity extends Activity {
     private void refreshState() {
         if (controller == null || prepare == null) return;
         boolean running = controller.isRunning();
+        statePet.setState(controller.getVisualState());
         boolean ready = controller.isReady();
         boolean accessible = PhoneAccessibilityService.isEnabled();
         boolean overlay = Settings.canDrawOverlays(this) || accessible;
@@ -273,7 +278,8 @@ public final class MainActivity extends Activity {
         control.setText(accessible ? "手机控制设置" : "开启手机控制");
         bubble.setText(!overlay ? "开启悬浮球权限" : preferences.getBoolean("bubble_enabled", true) ? "隐藏悬浮球" : "显示悬浮球");
         send.setEnabled(!running);
-        stop.setEnabled(running);
+        stop.setText(running ? "停止" : "重置");
+        stop.setEnabled(running || controller.canResetToIdle());
     }
 
     private void saveSettings() {

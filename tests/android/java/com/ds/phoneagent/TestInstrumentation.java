@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.Instrumentation;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ResolveInfo;
 import android.graphics.Rect;
 import android.os.Bundle;
@@ -15,19 +16,30 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.ScrollView;
+import android.widget.TextView;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import java.io.*;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.InvocationTargetException;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Sideload-only test APK. No command receiver is added to the actual app. */
@@ -80,6 +92,7 @@ public final class TestInstrumentation extends Instrumentation {
             else if ("input".equals(mode)) input();
             else if ("overlay".equals(mode)) overlay();
             else if ("pet".equals(mode)) pet();
+            else if ("routines".equals(mode)) routines();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -121,6 +134,218 @@ public final class TestInstrumentation extends Instrumentation {
         check(!version.isEmpty(), "Claude version output was empty");
         check(version.matches("(?s).*\\d+\\.\\d+\\.\\d+.*"), "Unexpected Claude version: " + version);
         log("Claude Code: " + version);
+    }
+
+    /** Real Linux Python/MCP and phone actions, with no model process or model configuration. */
+    private void routines() throws Exception {
+        long serviceDeadline = SystemClock.uptimeMillis() + 15000;
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Enable PhoneAgent accessibility before routines test");
+        check(!AgentController.get(getTargetContext()).isRunning(), "Do not test routines during an active task");
+        LinuxRuntime runtime = new LinuxRuntime(getTargetContext());
+        check(runtime.isInstalled(), "Run mode=runtime before mode=routines");
+        runtime.install(this::log); // Refresh bundled MCP modules without reinstalling a ready rootfs.
+        String suffix = UUID.randomUUID().toString();
+        String name = "codex_test_" + suffix.substring(0, 8);
+        String folder = "routines-smoke-" + suffix;
+        File isolated = new File(getTargetContext().getFilesDir(), "linux/home/.phoneagent/" + folder);
+        check(!isolated.exists(), "Unique routines test directory already exists");
+        long deadline = SystemClock.uptimeMillis() + 120000;
+        try (PhoneToolServer bridge = new PhoneToolServer(tool -> { })) {
+            Map<String, String> environment = new HashMap<>();
+            environment.put("PHONE_AGENT_PORT", Integer.toString(bridge.port()));
+            environment.put("PHONE_AGENT_TOKEN", bridge.token());
+            environment.put("PHONE_AGENT_ROUTINES_DIR", "/home/agent/.phoneagent/" + folder);
+            JSONObject appArguments = new JSONObject().put("package_name", "com.android.settings").put("timeout_ms", 8000);
+            try (McpClient first = new McpClient(startMcp(runtime, environment), deadline)) {
+                first.initialize();
+                first.requireTools("open_app_ready", "read_screen", "list_routines", "save_routine", "run_routine");
+                JSONObject empty = first.tool("list_routines", new JSONObject());
+                check(empty.getJSONArray("routines").length() == 0, "Isolated routine store was not empty");
+                check(isolated.isDirectory(), "MCP did not honor PHONE_AGENT_ROUTINES_DIR; refusing to continue");
+                JSONArray proofs = new JSONArray();
+                for (int i = 0; i < 2; i++) {
+                    JSONObject opened = first.tool("open_app_ready", appArguments);
+                    check("ready".equals(opened.optString("status")), "Settings did not become ready");
+                    check("com.android.settings".equals(opened.getJSONObject("screen").optString("package")),
+                            "Ready result did not observe Settings");
+                    String actionReceipt = opened.getString("routine_receipt");
+                    JSONObject observed = first.tool("read_screen", new JSONObject());
+                    check("com.android.settings".equals(observed.optString("package")), "Proof did not observe Settings");
+                    check(screenContainsText(observed, "设置"), "Proof did not contain Settings text");
+                    proofs.put(new JSONObject().put("step_receipts", new JSONArray().put(actionReceipt))
+                            .put("verification_receipt", observed.getString("routine_receipt")));
+                }
+                JSONObject saved = first.tool("save_routine", new JSONObject().put("name", name)
+                        .put("description", "Isolated device MCP smoke test")
+                        .put("steps", new JSONArray().put(new JSONObject().put("tool", "open_app_ready").put("arguments", appArguments)))
+                        .put("verify", new JSONObject().put("package", "com.android.settings").put("text_contains", new JSONArray().put("设置")))
+                        .put("proofs", proofs));
+                check(name.equals(saved.optString("name")), "MCP saved an unexpected routine name");
+                JSONObject executed = first.tool("run_routine", new JSONObject().put("name", name).put("timeout_ms", 20000));
+                check(executed.optInt("completed_steps") == 1, "Saved routine did not complete its single step");
+                JSONObject actual = first.tool("read_screen", new JSONObject());
+                check("com.android.settings".equals(actual.optString("package")) && screenContainsText(actual, "设置"),
+                        "Routine did not leave the actual Settings screen visible");
+                log("Real MCP verified two launches, saved the isolated routine, and executed it successfully");
+            }
+            try (McpClient second = new McpClient(startMcp(runtime, environment), deadline)) {
+                second.initialize();
+                JSONObject listed = second.tool("list_routines", new JSONObject());
+                JSONArray routines = listed.getJSONArray("routines");
+                boolean found = false;
+                for (int i = 0; i < routines.length(); i++)
+                    if (name.equals(routines.getJSONObject(i).optString("name"))) found = true;
+                check(found, "A fresh MCP process could not list the saved routine");
+                JSONArray candidates = listed.getJSONArray("candidates");
+                boolean candidateFound = false;
+                for (int i = 0; i < candidates.length(); i++) {
+                    JSONObject candidate = candidates.getJSONObject(i);
+                    JSONObject arguments = candidate.optJSONObject("arguments");
+                    if (arguments != null && "com.android.settings".equals(arguments.optString("package_name"))
+                            && candidate.optInt("success_count") >= 2) candidateFound = true;
+                }
+                check(candidateFound, "A fresh MCP process lost the repeated-launch candidate count");
+                log("Fresh MCP process listed the persisted routine and repeated-launch candidate");
+            }
+        } finally {
+            runtime.cancel();
+            File expectedParent = new File(getTargetContext().getFilesDir(), "linux/home/.phoneagent");
+            check(isolated.getName().equals(folder) && isolated.getParentFile().equals(expectedParent),
+                    "Refusing to clean an unexpected routine path");
+            deleteTestTree(isolated);
+        }
+        check(!isolated.exists(), "Isolated routines test directory was not removed");
+        log("Only the unique test store was removed; user routines and candidates were never accessed");
+    }
+
+    private Process startMcp(LinuxRuntime runtime, Map<String, String> environment) throws Exception {
+        Field root = LinuxRuntime.class.getDeclaredField("root");
+        Field epoch = LinuxRuntime.class.getDeclaredField("cancellationEpoch");
+        Method start = LinuxRuntime.class.getDeclaredMethod("start", List.class, Map.class, File.class, long.class);
+        root.setAccessible(true); epoch.setAccessible(true); start.setAccessible(true);
+        try {
+            return (Process) start.invoke(runtime, Arrays.asList("/usr/bin/python3", "/opt/phoneagent/phone_mcp.py"),
+                    environment, (File) root.get(runtime), ((AtomicLong) epoch.get(runtime)).get());
+        } catch (InvocationTargetException failure) {
+            Throwable cause = failure.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw failure;
+        }
+    }
+
+    private static boolean screenContainsText(JSONObject screen, String expected) throws Exception {
+        JSONArray nodes = screen.getJSONArray("nodes");
+        for (int i = 0; i < nodes.length(); i++) {
+            JSONObject node = nodes.getJSONObject(i);
+            if (node.optString("text").contains(expected) || node.optString("description").contains(expected)) return true;
+        }
+        return false;
+    }
+
+    private static void deleteTestTree(File path) throws IOException {
+        boolean link = java.nio.file.Files.isSymbolicLink(path.toPath());
+        if (!path.exists() && !link) return;
+        if (!link && path.isDirectory()) {
+            File[] children = path.listFiles();
+            if (children == null) throw new IOException("Cannot inspect isolated test directory");
+            for (File child : children) deleteTestTree(child);
+        }
+        if (!path.delete()) throw new IOException("Cannot remove isolated test artifact: " + path.getName());
+    }
+
+    private static final class McpClient implements AutoCloseable {
+        private final Process process;
+        private final BufferedWriter writer;
+        private final Thread reader;
+        private final LinkedBlockingQueue<JSONObject> replies = new LinkedBlockingQueue<>();
+        private final StringBuffer diagnostics = new StringBuffer();
+        private final long deadline;
+        private int sequence;
+
+        McpClient(Process process, long deadline) {
+            this.process = process;
+            this.deadline = deadline;
+            writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8));
+            reader = new Thread(() -> {
+                try (BufferedReader input = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = input.readLine()) != null) {
+                        try { replies.offer(new JSONObject(line)); }
+                        catch (Exception ignored) {
+                            synchronized (diagnostics) {
+                                diagnostics.append(line).append('\n');
+                                if (diagnostics.length() > 4000) diagnostics.delete(0, diagnostics.length() - 4000);
+                            }
+                        }
+                    }
+                } catch (IOException failure) { diagnostics.append(failure.getClass().getSimpleName()); }
+            }, "device-mcp-output");
+            reader.setDaemon(true);
+            reader.start();
+        }
+
+        void initialize() throws Exception {
+            JSONObject result = rpc("initialize", new JSONObject().put("protocolVersion", "2024-11-05")
+                    .put("capabilities", new JSONObject()).put("clientInfo", new JSONObject().put("name", "device-smoke").put("version", "1")));
+            check(result.has("serverInfo"), "MCP initialize did not return server information");
+            write(new JSONObject().put("jsonrpc", "2.0").put("method", "notifications/initialized"));
+        }
+
+        void requireTools(String... expected) throws Exception {
+            JSONArray tools = rpc("tools/list", new JSONObject()).getJSONArray("tools");
+            Set<String> names = new HashSet<>();
+            for (int i = 0; i < tools.length(); i++) names.add(tools.getJSONObject(i).getString("name"));
+            for (String name : expected) check(names.contains(name), "Real MCP did not advertise " + name);
+        }
+
+        JSONObject tool(String name, JSONObject arguments) throws Exception {
+            JSONObject result = rpc("tools/call", new JSONObject().put("name", name).put("arguments", arguments));
+            JSONArray content = result.getJSONArray("content");
+            JSONObject value = null;
+            for (int i = 0; i < content.length(); i++) {
+                JSONObject block = content.getJSONObject(i);
+                if ("text".equals(block.optString("type"))) {
+                    try { value = new JSONObject(block.getString("text")); } catch (Exception ignored) { }
+                    if (value != null) break;
+                }
+            }
+            check(value != null, "MCP " + name + " did not return a JSON result");
+            check(!result.optBoolean("isError") && value.optBoolean("ok"), "MCP " + name + " failed: " + value.optString("error"));
+            return value;
+        }
+
+        private JSONObject rpc(String method, JSONObject params) throws Exception {
+            int id = ++sequence;
+            write(new JSONObject().put("jsonrpc", "2.0").put("id", id).put("method", method).put("params", params));
+            long responseDeadline = Math.min(deadline, SystemClock.uptimeMillis() + 35000);
+            while (SystemClock.uptimeMillis() < responseDeadline) {
+                JSONObject reply = replies.poll(Math.min(500, Math.max(1, responseDeadline - SystemClock.uptimeMillis())), TimeUnit.MILLISECONDS);
+                if (reply == null) {
+                    if (!process.isAlive()) throw new IOException("MCP process exited before " + method + ": " + diagnostics);
+                    continue;
+                }
+                if (reply.optInt("id", -1) != id) continue;
+                check(!reply.has("error"), "MCP protocol rejected " + method + ": " + reply.optJSONObject("error"));
+                return reply.getJSONObject("result");
+            }
+            throw new IOException("MCP timed out during " + method + ": " + diagnostics);
+        }
+
+        private void write(JSONObject message) throws IOException {
+            writer.write(message.toString());
+            writer.newLine();
+            writer.flush();
+        }
+
+        @Override public void close() throws Exception {
+            try { writer.close(); } catch (IOException ignored) { }
+            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroy();
+            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly();
+            try { process.getInputStream().close(); } catch (IOException ignored) { }
+            reader.join(1000);
+        }
     }
 
     private void tools() throws Exception {
@@ -256,6 +481,15 @@ public final class TestInstrumentation extends Instrumentation {
         check(!controller.isRunning(), "An existing task is already running");
         ControllerProbe completed = new ControllerProbe();
         ControllerProbe stopped = new ControllerProbe();
+        ControllerProbe failed = new ControllerProbe();
+        List<String> changedModelKeys = new CopyOnWriteArrayList<>();
+        SharedPreferences settings = getTargetContext().getSharedPreferences("phoneagent", Context.MODE_PRIVATE);
+        SharedPreferences.OnSharedPreferenceChangeListener configurationObserver = (preferences, key) -> {
+            // Observe change notifications only: never read model values or credentials.
+            if (key == null || key.equals("base_url") || key.equals("model") || key.equals("key_ciphertext") || key.equals("key_iv"))
+                changedModelKeys.add(key == null ? "<clear>" : key);
+        };
+        settings.registerOnSharedPreferenceChangeListener(configurationObserver);
         Field processField = AgentController.class.getDeclaredField("process");
         processField.setAccessible(true);
         try {
@@ -263,7 +497,7 @@ public final class TestInstrumentation extends Instrumentation {
             runOnMainSync(() -> {
                 controller.setListener(completed);
                 controller.run("请先返回桌面并读取界面，然后打开系统设置并再次读取界面确认。",
-                        "http://127.0.0.1:18080", "phoneagent-smoke-model", "local-test-only");
+                        "http://127.0.0.1:18080", "phoneagent-smoke-ready", "local-test-only");
             });
             check(completed.finished.await(120, TimeUnit.SECONDS),
                     "Controller did not finish in 2 minutes; status=" + completed.status.get() + "\n" + completed.output.get());
@@ -282,6 +516,7 @@ public final class TestInstrumentation extends Instrumentation {
                 JSONObject screen = waitForPackage(verification, resolve(new Intent(Settings.ACTION_SETTINGS)));
                 log("Controller output and actual Settings screen verified: " + screen.getString("package"));
             }
+            assertTerminalReset(controller, completed, "SUCCESS");
 
             runOnMainSync(() -> {
                 controller.removeListener(completed);
@@ -293,6 +528,7 @@ public final class TestInstrumentation extends Instrumentation {
             while (controller.isRunning() && processField.get(controller) == null
                     && SystemClock.uptimeMillis() < launchDeadline) SystemClock.sleep(50);
             check(controller.isRunning(), "Unreachable-loopback task exited before Stop could be tested: " + stopped.message.get());
+            assertRunningResetRejected(controller, stopped);
             log("Testing Stop with process present=" + (processField.get(controller) != null));
             runOnMainSync(controller::stop);
             check(stopped.finished.await(10, TimeUnit.SECONDS),
@@ -306,13 +542,126 @@ public final class TestInstrumentation extends Instrumentation {
             assertStatesInOrder(stopped, AgentController.VisualState.THINKING,
                     AgentController.VisualState.STOPPING, AgentController.VisualState.STOPPED);
             log("Controller Stop callback, running flag and process cleanup verified");
+            assertTerminalReset(controller, stopped, "STOPPED");
+
+            runOnMainSync(() -> {
+                controller.removeListener(stopped);
+                controller.setListener(failed);
+                controller.run("本地错误恢复测试，不需要操作手机。", "http://127.0.0.1:18080",
+                        "phoneagent-smoke-error", "local-test-only");
+            });
+            check(failed.finished.await(90, TimeUnit.SECONDS), "Intentional local error task did not finish");
+            check(!failed.success.get() && controller.getVisualState() == AgentController.VisualState.ERROR,
+                    "Local fixture did not produce Controller ERROR: " + failed.message.get());
+            check(failed.output.get().contains("Intentional local fixture failure"),
+                    "ERROR was not caused by the intentional local fixture response: " + failed.output.get());
+            assertErrorResetButton(controller);
+            check(changedModelKeys.isEmpty(), "Controller/reset modified model configuration keys: " + changedModelKeys);
+            log("SUCCESS, STOPPED and UI ERROR reset preserved output and model configuration; running reset was rejected");
         } finally {
             runOnMainSync(() -> {
                 controller.stop();
                 controller.removeListener(completed);
                 controller.removeListener(stopped);
+                controller.removeListener(failed);
             });
+            settings.unregisterOnSharedPreferenceChangeListener(configurationObserver);
         }
+    }
+
+    private void assertRunningResetRejected(AgentController controller, ControllerProbe probe) throws Exception {
+        check(controller.isRunning() && !controller.canResetToIdle(), "Running task incorrectly permits reset");
+        String beforeOutput = controllerOutput(controller);
+        AgentController.VisualState beforeState = controller.getVisualState();
+        int beforeFinished = probe.finishedCallbacks.get();
+        runOnMainSync(controller::resetToIdle);
+        // A second main-thread barrier waits for reset's posted no-op to execute.
+        runOnMainSync(() -> { });
+        check(controller.isRunning(), "Reset interrupted a running task");
+        check(controller.getVisualState() == beforeState, "Reset changed a running task's visual state");
+        check(beforeOutput.equals(controllerOutput(controller)), "Reset changed a running task's output");
+        check(probe.finishedCallbacks.get() == beforeFinished, "Running reset fabricated a completion callback");
+        log("Running task rejects reset without changing task, state or output");
+    }
+
+    private void assertTerminalReset(AgentController controller, ControllerProbe probe, String source) throws Exception {
+        check(!controller.isRunning() && controller.canResetToIdle(), source + " should permit reset");
+        String beforeOutput = controllerOutput(controller);
+        int beforeFinished = probe.finishedCallbacks.get();
+        runOnMainSync(controller::resetToIdle);
+        waitForControllerState(controller, AgentController.VisualState.IDLE);
+        check(!controller.isRunning(), source + " reset started a task");
+        check(beforeOutput.equals(controllerOutput(controller)), source + " reset changed the retained output");
+        check(probe.finishedCallbacks.get() == beforeFinished, source + " reset fabricated a completion callback");
+        log(source + " reset to IDLE while retaining task output");
+    }
+
+    private void assertErrorResetButton(AgentController controller) throws Exception {
+        String beforeOutput = controllerOutput(controller);
+        runOnMainSync(() -> getTargetContext().startActivity(new Intent(getTargetContext(), MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
+        waitForMainActivityVisible();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        // The test owned the single Listener while collecting the CLI result. Hand
+        // it back to MainActivity's actual Listener before exercising its button.
+        runOnMainSync(() -> {
+            try {
+                Field listener = MainActivity.class.getDeclaredField("listener");
+                listener.setAccessible(true);
+                controller.setListener((AgentController.Listener) listener.get(resumedMain));
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        runOnMainSync(() -> { });
+        AtomicBoolean clicked = new AtomicBoolean();
+        runOnMainSync(() -> {
+            try {
+                Field field = MainActivity.class.getDeclaredField("stop");
+                field.setAccessible(true);
+                TextView stop = (TextView) field.get(resumedMain);
+                if (!stop.isShown() || !stop.isEnabled() || !"重置".contentEquals(stop.getText()))
+                    throw new IllegalStateException("ERROR state did not expose an enabled reset action on the stop button");
+                clicked.set(stop.performClick());
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        check(clicked.get(), "Reset button did not handle click");
+        waitForControllerState(controller, AgentController.VisualState.IDLE);
+        check(!controller.isRunning(), "UI reset started a task");
+        check(beforeOutput.equals(controllerOutput(controller)), "UI ERROR reset changed retained output");
+        AtomicBoolean enabled = new AtomicBoolean(true);
+        runOnMainSync(() -> {
+            try {
+                Field field = MainActivity.class.getDeclaredField("stop");
+                field.setAccessible(true);
+                enabled.set(((View) field.get(resumedMain)).isEnabled());
+            } catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        check(!enabled.get(), "Reset action remains enabled after reaching IDLE");
+        log("Actual stop/reset button changed ERROR to IDLE without clearing task output");
+    }
+
+    private void waitForControllerState(AgentController controller, AgentController.VisualState expected) {
+        long deadline = SystemClock.uptimeMillis() + 2000;
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (controller.getVisualState() == expected) return;
+            SystemClock.sleep(50);
+        }
+        throw new AssertionError("Controller state did not reach " + expected + ": " + controller.getVisualState());
+    }
+
+    private String controllerOutput(AgentController controller) throws Exception {
+        Field field = AgentController.class.getDeclaredField("lastOutput");
+        field.setAccessible(true);
+        AtomicReference<String> value = new AtomicReference<>();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try { value.set((String) field.get(controller)); }
+            catch (Exception error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw failure.get();
+        return value.get();
     }
 
     /** Exercise real gestures and Chinese input only inside our own task composer. */
@@ -808,11 +1157,13 @@ public final class TestInstrumentation extends Instrumentation {
         final AtomicReference<String> status = new AtomicReference<>("");
         final AtomicReference<String> output = new AtomicReference<>("");
         final AtomicReference<String> message = new AtomicReference<>("");
+        final AtomicInteger finishedCallbacks = new AtomicInteger();
         final List<AgentController.VisualState> states = new CopyOnWriteArrayList<>();
         @Override public void onVisualState(AgentController.VisualState state) { states.add(state); }
         @Override public void onStatus(String value) { status.set(value); }
         @Override public void onOutput(String value) { output.set(value); }
         @Override public void onFinished(boolean ok, String value) {
+            finishedCallbacks.incrementAndGet();
             success.set(ok);
             message.set(value);
             finished.countDown();

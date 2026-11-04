@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "app/src/main/assets/phone_mcp.py"
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location("phone_mcp", SCRIPT)
 mcp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mcp)
@@ -27,7 +29,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual([reply["id"] for reply in replies], [1, 2])
         self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "phone")
         names = {tool["name"] for tool in replies[1]["result"]["tools"]}
-        self.assertEqual(names, {"read_screen", "home", "back", "open_settings", "open_app", "tap", "swipe", "type_text"})
+        self.assertEqual(names, {"read_screen", "home", "back", "open_settings", "open_app", "open_app_ready", "tap", "swipe", "type_text", "list_routines", "save_routine", "run_routine"})
         self.assertNotIn("shell", names)
 
     def test_bridge_preserves_chinese_text_and_auth_and_bypasses_proxy(self):
@@ -72,6 +74,64 @@ class McpTests(unittest.TestCase):
         self.assertEqual(mcp.handle([])["error"]["code"], -32600)
         reply = mcp.handle({"id": 6, "method": "tools/call", "params": []})
         self.assertTrue(reply["result"]["isError"])
+
+    def test_routines_integrate_receipts_persistence_and_unrecorded_child_steps(self):
+        screen = {"ok": True, "package": "com.android.settings", "locked": False,
+                  "nodes": [{"text": "设置", "description": "私人界面内容"}]}
+
+        def action(name, arguments):
+            if name == "open_app_ready":
+                return {"ok": True, "status": "ready", "screen": screen}
+            self.assertEqual(name, "read_screen")
+            return dict(screen)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"PHONE_AGENT_ROUTINES_DIR": directory}), \
+                patch.object(mcp, "_ROUTINE_STORE", None), \
+                patch.object(mcp, "invoke_phone", side_effect=action):
+            first = mcp.invoke("open_app_ready", {"package_name": "com.android.settings"})
+            second = mcp.invoke("open_app_ready", {"package_name": "com.android.settings"})
+            self.assertNotEqual(first["routine_receipt"], second["routine_receipt"])
+            store = mcp.get_routine_store()
+            self.assertEqual(store.root, Path(directory))
+            self.assertEqual(len(store.history), 2)
+            candidates = mcp.invoke("list_routines", {})["candidates"]
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["success_count"], 2)
+            persisted = Path(directory, ".open_successes.json").read_text()
+            self.assertNotIn("私人界面内容", persisted)
+            self.assertNotIn("routine_receipt", persisted)
+            verification = mcp.invoke("read_screen", {})["routine_receipt"]
+            saved = mcp.invoke("save_routine", {
+                "name": "open_settings_ready", "steps": [{"tool": "open_app_ready", "arguments": {"package_name": "com.android.settings"}}],
+                "verify": {"package": "com.android.settings", "text_contains": ["设置"]},
+                "candidate_id": candidates[0]["candidate_id"], "verification_receipt": verification})
+            self.assertTrue(saved["ok"], saved)
+            count_before = len(store.history)
+            result = mcp.invoke("run_routine", {"name": "open_settings_ready"})
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(store.history), count_before + 1)
+            self.assertEqual(store.history[-1]["tool"], "run_routine")
+            self.assertIsNone(store.history[-1]["receipt"])
+            self.assertEqual(mcp.invoke("list_routines", {})["candidates"][0]["success_count"], 2)
+            mcp._ROUTINE_STORE = None
+            reloaded = mcp.invoke("list_routines", {})
+            self.assertEqual(reloaded["routines"][0]["name"], "open_settings_ready")
+            self.assertEqual(reloaded["candidates"][0]["success_count"], 2)
+            self.assertEqual(len(mcp.get_routine_store().history), 0)
+
+    def test_receipt_failure_does_not_relabel_real_action_or_leak_exception(self):
+        with patch.object(mcp, "invoke_phone", return_value={"ok": True}), \
+                patch.object(mcp, "get_routine_store") as get_store:
+            get_store.return_value.record_action.side_effect = OSError("private exception text")
+            value = mcp.invoke("home", {})
+        self.assertTrue(value["ok"])
+        self.assertIn("routine_record_error", value)
+        self.assertNotIn("private exception text", json.dumps(value))
+
+    def test_routine_child_dispatch_cannot_recurse(self):
+        with self.assertRaisesRegex(ValueError, "Unknown Android bridge tool"):
+            mcp.invoke_phone("run_routine", {"name": "nested"})
 
 
 if __name__ == "__main__":

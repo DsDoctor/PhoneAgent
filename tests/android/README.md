@@ -15,6 +15,16 @@ python3 scripts/test-device.py tools
 
 `runtime` prepares the offline payload and checks the actual Claude Code executable's version. `tools` verifies the loopback binding, token authorization, unknown-tool rejection, Home, Settings, Back and screen reading. It does not alter a system setting. Existing Settings navigation stacks may remain after Back, so the test explicitly returns to Home at the end.
 
+## Real MCP routines, without a model
+
+`routines` launches the phone's actual Linux Python and `phone_mcp.py` over stdio. It discovers the real tools, executes `open_app_ready` for `com.android.settings` twice, collects real action and screen-verification receipts, saves one verified JSON routine, and runs it. A second MCP process then lists the saved routine and persisted repeated-launch candidate, proving persistence across processes. It verifies the actual Settings package and readable “设置” text, without changing a setting.
+
+The MCP processes receive `PHONE_AGENT_ROUTINES_DIR=/home/agent/.phoneagent/routines-smoke-<unique-id>`. This isolated store is required to appear before the test performs actions; the default user routine/candidate store is never accessed. Cleanup removes only that unique test directory. HOME remains unchanged. This mode does not launch Claude Code, contact a model, read credentials, use the host mock server or require an ADB reverse port.
+
+```bash
+python3 scripts/test-device.py routines
+```
+
 Use `scripts/test-device.py` rather than invoking instrumentation directly on Huawei. Instrumentation restarts the target process, which can leave its accessibility service marked as crashed. The runner toggles only PhoneAgent's service after the test has started, preserving other enabled services, and restores the app afterwards.
 
 ## Gestures and Chinese input
@@ -49,6 +59,8 @@ The fixture binds only `127.0.0.1` and accepts the disposable key `local-test-on
 
 With the same local fixture and reversed port running, `controller` uses the actual `AgentController.run` path used by the UI. It waits for a successful completion callback, checks that parsed assistant output contains the fixture's final text, confirms `isRunning()` is false and the process reference is cleared, and verifies the actual Settings screen.
 
+Its successful task uses the dedicated fixture model `phoneagent-smoke-ready`: `home → read_screen → open_app_ready(package_name="com.android.settings", timeout_ms=8000) → read_screen`. The actual MCP readiness tool waits for Settings to become readable and stable, so a transient empty accessibility root during the launch is not mistaken for a completed transition. Tool errors still fail the fixture; no error is swallowed. The separate `loop` mode retains the original `phoneagent-smoke-model` sequence using `open_settings`.
+
 It then starts another task against the deliberately unreachable loopback address `http://127.0.0.1:9` using only the disposable test key. After observing process startup (or at most three seconds), it calls Stop and requires a cancellation callback plus cleared running/process state within ten seconds. This checks cancellation without contacting an external service.
 
 ```bash
@@ -58,6 +70,8 @@ python3 scripts/test-device.py controller
 As with `loop`, this validates integration and lifecycle handling, not a real external model.
 
 The controller test also requires visual-state callbacks in the order `THINKING → ACTING → THINKING → SUCCESS` for the fixture task and `THINKING → STOPPING → STOPPED` for cancellation. Repeated states and additional tool rounds are allowed. It checks the final state exposed by `getVisualState()` rather than simulating or writing Controller state.
+
+The same run covers resetting to idle without repeating those success/stop tasks: SUCCESS and STOPPED reset to IDLE while retaining `lastOutput`, and reset during the unreachable-loopback task must be a strict no-op. A third task uses the fixture-only model name `phoneagent-smoke-error`, which returns an intentional HTTP 400 and produces a real Controller ERROR. The test clicks MainActivity's existing stop button after it changes to an enabled “重置” action, then checks IDLE and retained output. It observes model-setting **change keys only**, never their values or credentials, and requires that no model setting changed. No product test endpoint or real model request is involved.
 
 ## Overlay and cat animation
 

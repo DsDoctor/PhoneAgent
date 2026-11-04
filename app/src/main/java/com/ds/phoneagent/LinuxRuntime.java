@@ -131,10 +131,17 @@ public final class LinuxRuntime {
                 "--output-format", "stream-json", "--verbose",
                 "--tools", "", "--allowedTools", "mcp__phone__*",
                 "--permission-mode", "dontAsk", "--strict-mcp-config",
-                "--mcp-config", "/opt/phoneagent/mcp.json", "--max-turns", "12",
+                "--mcp-config", "/opt/phoneagent/mcp.json", "--max-turns", "30",
                 "--append-system-prompt",
                 "你是用户手机上的简洁助手。请用中文回答，按用户要求通过 phone MCP 工具操作手机。"
                 + "先观察界面，再执行动作，再读取界面确认实际结果。不要把工具请求成功说成任务完成。"
+                + "任务开始先用 list_routines 查看可复用脚本和已验证操作；有合适脚本优先 run_routine。"
+                + "打开应用优先用 open_app_ready，它在本地等待加载并返回最终 screen；直接利用这个界面继续决策，不必机械地再读一次。"
+                + "遇到 blocked 或错误要依据返回的原因调整；同一动作两次没有进展时换方法或向用户说明，不能盲目重复。"
+                + "反复使用的基础导航操作，只有实际重复跑通并核对最终界面后，才用 save_routine 和真实 routine_receipt 整理成可复用脚本。"
+                + "优先保存打开应用、等待就绪、导航到稳定页面等短流程；使用清晰名称、前台应用检查和明确的最终验证条件。"
+                + "不得编造成功凭据，不把临时广告、账号登录、密码验证码、支付或订单确认固化为基础脚本；脚本失败时依据实际 screen 处理。"
+                + "每个任务最多30轮、5分钟，优先完成用户目标，有预算再整理已验证脚本，并简要告诉用户新增或复用了什么。"
                 + "只有这些手机工具可用；不能执行电脑或终端操作。遇到权限或锁屏限制请直接说明。"));
         if (model != null && !model.trim().isEmpty()) {
             args.add("--model"); args.add(model.trim());
@@ -208,9 +215,11 @@ public final class LinuxRuntime {
 
     private void updateBridge() throws Exception {
         mkdir(bridge);
-        try (InputStream input = context.getAssets().open("phone_mcp.py");
-             OutputStream output = new FileOutputStream(new File(bridge, "phone_mcp.py"))) {
-            copy(input, output);
+        for (String name : new String[]{"phone_mcp.py", "phone_routines.py"}) {
+            try (InputStream input = context.getAssets().open(name);
+                 OutputStream output = new FileOutputStream(new File(bridge, name))) {
+                copy(input, output);
+            }
         }
         JSONObject server = new JSONObject();
         server.put("command", "/usr/bin/python3");

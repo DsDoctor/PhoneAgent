@@ -127,6 +127,32 @@ Before repositioning rows between gestures, the harness sends ScrollView a local
 python3 scripts/test-device.py historyui
 ```
 
+## Interactive Controller lifecycle
+
+`interaction` uses the actual Controller and phone-installed Claude Code with a separate local fixture. The bounded runner starts/stops the fixture, owns and cleans its reverse port, and compares user history/preferences/Linux HOME hashes before and after. It requires a serial and defaults to a 240-second total budget, including cleanup:
+
+```bash
+python3 scripts/test-interaction.py --serial DEVICE_SERIAL
+```
+
+To run the fixture manually, start a **fresh** instance for each run:
+
+```bash
+python3 tests/interaction_fixture.py --port 18081
+```
+
+In another terminal, with only the intended device selected:
+
+```bash
+adb reverse tcp:18081 tcp:18081
+python3 scripts/test-device.py interaction
+adb reverse --remove tcp:18081
+```
+
+It waits for native `AskUserQuestion`, rejects answers from another conversation or an outdated question ID, submits the actual answer, and requires the same CLI session to finish successfully. It checks that a submitted answer waits for the task UI to hide, including a deterministically queued hide/show race. A copy of the real waiting record and its native session is then reconstructed in another isolated store/HOME: it must remain `WAITING_USER`, create no process or model request until explicitly answered, and resume the original native question context in the same session. Another copy checks Stop/Reset while offline. A delayed fixture request exercises native pause, a closed phone bridge, old actions already queued for Android's main thread, and correction followed by continuation in the same process/session. A final live question is stopped and reset, requiring its process to be reaped and its output retained.
+
+All test history, CLI session files, native memory, bridge files and temporary files live under one unique cache directory, which is removed afterwards. Only the installed rootfs is shared; this mode never calls runtime installation. User history, Linux HOME and model preferences are not written. The fixture's `/status` endpoint exposes only a request count and a delay-started flag to synchronize the pause test without guessing a sleep duration. No real model endpoint or key is used. This Controller test complements `scripts/probe-interaction.py`, whose separate isolated probe covers native file tools, native memory loading/writing, and raw transport protocol behavior.
+
 ## Real Claude session continuation
 
 Start the updated local fixture and reverse port 18080 as described above, then run:

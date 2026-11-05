@@ -66,6 +66,15 @@ final class TaskHistoryStore {
                 JSONArray turns = conversation.getJSONArray("turns");
                 for (int j = 0; j < turns.length(); j++) {
                     JSONObject turn = turns.getJSONObject(j);
+                    if (LastTaskStore.isPauseTransition(turn.optString("state"))) {
+                        long now = System.currentTimeMillis();
+                        turn.put("state", "paused").put("reason", "process_paused")
+                                .put("status", "应用已重启，任务保持暂停；补充指令后可继续。")
+                                .put("updated_at", now).put("ended_at", 0);
+                        conversation.put("updated_at", now);
+                        changed = true;
+                        continue;
+                    }
                     if (!"running".equals(turn.optString("state"))) continue;
                     long now = System.currentTimeMillis();
                     String terminal = LastTaskStore.terminalFooter("中断", "应用重新启动时，上次任务尚未完成。",
@@ -79,6 +88,7 @@ final class TaskHistoryStore {
                     conversation.put("status", "interrupted").put("updated_at", now);
                     changed = true;
                 }
+                if (turns.length() > 0) conversation.put("status", turns.getJSONObject(turns.length() - 1).optString("state"));
             }
             if (changed) persist();
         } catch (Exception failure) { restore(before); throw io(failure); }
@@ -146,7 +156,14 @@ final class TaskHistoryStore {
             JSONArray turns = conversation.getJSONArray("turns");
             for (int i = 0; i < turns.length(); i++) {
                 if (!turnId.equals(turns.getJSONObject(i).optString("id"))) continue;
-                JSONObject clean = normalizeTurn(record);
+                JSONObject previous = turns.getJSONObject(i);
+                JSONObject incoming = new JSONObject(record.toString());
+                // Progress-only updates retain interaction data; explicit JSON null clears it.
+                if (!incoming.has("pending_question") && LastTaskStore.isSuspended(incoming.optString("state"))
+                        && previous.has("pending_question")) incoming.put("pending_question", previous.get("pending_question"));
+                if (!incoming.has("interaction_answer") && previous.has("interaction_answer"))
+                    incoming.put("interaction_answer", previous.get("interaction_answer"));
+                JSONObject clean = normalizeTurn(incoming);
                 clean.put("id", turnId);
                 turns.put(i, clean);
                 conversation.put("updated_at", clean.optLong("updated_at")).put("status", clean.optString("state"));
@@ -258,8 +275,7 @@ final class TaskHistoryStore {
     }
     private static JSONObject normalizeTurn(JSONObject source) throws Exception {
         String state = source.optString("state");
-        if (!(state.equals("running") || state.equals("success") || state.equals("error")
-                || state.equals("stopped") || state.equals("interrupted"))) throw new IOException("Invalid turn state");
+        if (!LastTaskStore.validState(state)) throw new IOException("Invalid turn state");
         String id = source.optString("id", UUID.randomUUID().toString());
         if (!LinuxRuntime.isSessionId(id)) throw new IOException("Invalid turn id");
         JSONObject clean = new JSONObject().put("id", id).put("state", state);
@@ -270,6 +286,7 @@ final class TaskHistoryStore {
             Integer value = LastTaskStore.optionalInt(source, key);
             if (value != null) clean.put(key, value);
         }
+        LastTaskStore.copyInteraction(source, clean);
         return clean;
     }
     private static JSONObject emptyDocument() {

@@ -163,9 +163,9 @@ public final class MonthlyCatView extends View {
     private int row() {
         switch (state) {
             case PREPARING: case ACTING: return 7;
-            case THINKING: return 6;
+            case THINKING: case PAUSED: case RESUMING: return 6;
             case SUCCESS: return 4;
-            case NEEDS_INPUT: case STOPPING: return 8;
+            case NEEDS_INPUT: case STOPPING: case PAUSING: case WAITING_USER: return 8;
             case ERROR: return 5;
             case STOPPED: return 3;
             default: return 0;
@@ -194,6 +194,10 @@ public final class MonthlyCatView extends View {
             case ERROR: return "出错";
             case STOPPING: return "停止中";
             case STOPPED: return "已停止";
+            case PAUSING: return "暂停中";
+            case PAUSED: return "已暂停";
+            case WAITING_USER: return "等你";
+            case RESUMING: return "继续中";
             default: return "待命";
         }
     }

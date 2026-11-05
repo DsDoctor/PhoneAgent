@@ -403,9 +403,10 @@ class Regression:
             raise Failure("Existing history/last-task is not valid JSON; no UI actions performed") from error
         self.conversations = history.get("conversations", [])
         require(isinstance(self.conversations, list), "History has an invalid conversation list")
-        require(last.get("state") != "running" and not any(
-            t.get("state") == "running" for c in self.conversations for t in c.get("turns", [])),
-            "A persisted running task exists; wait for it to finish before UI regression")
+        active_states = {"running", "pausing", "paused", "waiting_user", "resuming"}
+        require(last.get("state") not in active_states and not any(
+            t.get("state") in active_states for c in self.conversations for t in c.get("turns", [])),
+            "An active or pending task exists; finish it before UI regression")
         item["conversation_count"] = len(self.conversations)
         package = self.adb.shell("dumpsys", "package", PACKAGE, label="installed version")
         version = re.search(r"versionName=([^\s]+)", package)

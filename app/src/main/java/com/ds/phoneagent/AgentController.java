@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
 
 /** Owns one task at a time; the actual agent loop belongs to Claude Code. */
 public final class AgentController {
-    public enum VisualState { IDLE, PREPARING, THINKING, ACTING, SUCCESS, NEEDS_INPUT, ERROR, STOPPING, STOPPED }
+    public enum VisualState { IDLE, PREPARING, THINKING, ACTING, SUCCESS, NEEDS_INPUT, ERROR, STOPPING, STOPPED, PAUSING, PAUSED, WAITING_USER, RESUMING }
     public interface Listener {
         void onStatus(String status);
         void onOutput(String output);
@@ -44,6 +44,15 @@ public final class AgentController {
     private volatile String lastStatus = "先准备运行环境，再配置模型和手机权限。";
     private volatile String lastOutput = "";
     private volatile String activeConversationId = "";
+    private final PhoneActionGate actionGate = new PhoneActionGate();
+    private final ExecutorService controls = Executors.newSingleThreadExecutor();
+    private volatile ClaudeTransport transport;
+    private volatile TaskRun activeTask;
+    private volatile JSONObject pendingQuestion;
+    private volatile boolean pauseRequested, turnSettled, initialized, userSent, uiVisible, interruptAcknowledged;
+    private volatile String initializeId = "", interruptId = "";
+    private Runnable deferredResume;
+    private PowerManager.WakeLock taskWakeLock;
 
     private AgentController(Context context) {
         this(context, new LinuxRuntime(context));
@@ -86,7 +95,18 @@ public final class AgentController {
             visualState = state.equals("success") ? VisualState.SUCCESS
                     : state.equals("stopped") ? VisualState.STOPPED : VisualState.ERROR;
         }
-        // A persisted record can restore presentation, never a running process.
+        // A persisted interaction restores a waiting UI, never starts a model request.
+        JSONObject restored = historyStore.getConversation(activeConversationId);
+        JSONArray restoredTurns = restored == null ? null : restored.optJSONArray("turns");
+        JSONObject restoredTurn = restoredTurns == null || restoredTurns.length() == 0 ? null
+                : restoredTurns.optJSONObject(restoredTurns.length() - 1);
+        if (restoredTurn != null && isPendingState(restoredTurn.optString("state"))) {
+            pendingQuestion = copy(restoredTurn.optJSONObject("pending_question"));
+            pauseRequested = pendingQuestion == null;
+            turnSettled = true;
+            visualState = pendingQuestion == null ? VisualState.PAUSED : VisualState.WAITING_USER;
+            lastStatus = pendingQuestion == null ? "任务已暂停，输入补充后继续。" : "正在等你回答，回答后继续原任务。";
+        }
     }
     public void setListener(Listener listener) {
         this.listener = listener;
@@ -96,7 +116,41 @@ public final class AgentController {
         } });
     }
     public void removeListener(Listener listener) { if (this.listener == listener) this.listener = null; }
-    public boolean isRunning() { return running; }
+    public boolean isRunning() { return running && !isSuspended(); }
+    public boolean hasActiveTask() { return running || isSuspended(); }
+    private boolean isSuspended() {
+        return pauseRequested || pendingQuestion != null || visualState == VisualState.RESUMING;
+    }
+    private static boolean isPendingState(String state) {
+        return state.equals("paused") || state.equals("waiting_user") || state.equals("pausing") || state.equals("resuming");
+    }
+    private static JSONObject copy(JSONObject value) {
+        try { return value == null ? null : new JSONObject(value.toString()); }
+        catch (Exception invalid) { return null; }
+    }
+    public synchronized boolean canAcceptInput() {
+        return !cancelled && actionGate.isIdle() && (!running || initialized && transport != null && transport.getProcess().isAlive()) && (visualState == VisualState.WAITING_USER && pendingQuestion != null
+                || visualState == VisualState.PAUSED && (turnSettled || process == null));
+    }
+    public JSONObject getPendingQuestion() { return copy(pendingQuestion); }
+    public synchronized void setTaskUiVisible(boolean visible) {
+        uiVisible = visible;
+        if (visible && hasActiveTask() && activeTask != null) actionGate.close();
+        if (!visible && deferredResume != null) {
+            Runnable next = deferredResume;
+            deferredResume = null;
+            dispatchWhenHidden(next);
+        }
+    }
+    private synchronized void dispatchWhenHidden(Runnable action) {
+        if (uiVisible) { deferredResume = action; return; }
+        controls.execute(() -> {
+            synchronized (AgentController.this) {
+                if (uiVisible) { deferredResume = action; return; }
+                action.run();
+            }
+        });
+    }
     public boolean isReady() { return runtime.isInstalled(); }
     public VisualState getVisualState() { return visualState; }
     public String getActiveConversationId() { return activeConversationId; }
@@ -111,7 +165,7 @@ public final class AgentController {
         return conversation;
     }
     public synchronized String importConversation(JSONObject conversation) throws IOException {
-        if (running) throw new IOException("请等待当前任务结束后导入会话。");
+        if (hasActiveTask()) throw new IOException("请等待当前任务结束后导入会话。");
         String id = historyStore.importConversation(conversation);
         if (activeConversationId.isEmpty()) activeConversationId = id;
         historyChanged(presentationEpoch.get());
@@ -122,7 +176,7 @@ public final class AgentController {
     public synchronized boolean deleteConversation(String id) throws IOException {
         JSONObject conversation = historyStore.getConversation(id);
         if (conversation == null) return false;
-        if (running && id.equals(activeConversationId)) throw new IOException("这段对话正在运行，请先停止任务再删除。");
+        if (hasActiveTask() && id.equals(activeConversationId)) throw new IOException("这段对话正在运行，请先停止任务再删除。");
 
         JSONObject previous = taskStore.read();
         boolean clearedLast = false;
@@ -140,7 +194,7 @@ public final class AgentController {
             throw failure;
         }
 
-        boolean changePresentation = !running && (id.equals(activeConversationId) || clearedLast);
+        boolean changePresentation = !hasActiveTask() && (id.equals(activeConversationId) || clearedLast);
         final long epoch;
         if (changePresentation) {
             epoch = presentationEpoch.incrementAndGet();
@@ -197,7 +251,7 @@ public final class AgentController {
         String explanation = "";
         if (!LinuxRuntime.isSessionId(session)) explanation = "这条旧任务没有保存可恢复的会话，请新建任务。";
         else if (!runtime.hasClaudeSession(session)) explanation = "原会话文件已丢失，无法继续；请新建任务。";
-        else if (running) explanation = "请等待当前任务结束后继续。";
+        else if (hasActiveTask()) explanation = "请等待当前任务结束后继续。";
         try { conversation.put("can_continue", explanation.isEmpty()).put("continue_unavailable_reason", explanation); }
         catch (Exception ignored) { }
     }
@@ -209,7 +263,7 @@ public final class AgentController {
         });
     }
     public boolean canResetToIdle() {
-        if (running) return false;
+        if (hasActiveTask()) return false;
         VisualState current = visualState;
         return current == VisualState.ERROR || current == VisualState.STOPPED
                 || current == VisualState.SUCCESS || current == VisualState.NEEDS_INPUT;
@@ -256,7 +310,7 @@ public final class AgentController {
     }
     private void phase(long epoch, VisualState value, String message) {
         main.post(() -> {
-            if (epoch != presentationEpoch.get() || !running || cancelled) return;
+            if (epoch != presentationEpoch.get() || !running || cancelled || isSuspended()) return;
             lastStatus = message;
             publishVisualState(value);
             Listener l = listener;
@@ -265,7 +319,7 @@ public final class AgentController {
     }
     private void output(long epoch, String value) {
         main.post(() -> {
-            if (epoch != presentationEpoch.get() || !running) return;
+            if (epoch != presentationEpoch.get() || !hasActiveTask()) return;
             lastOutput = value;
             Listener l = listener;
             if (l != null) l.onOutput(value);
@@ -276,7 +330,12 @@ public final class AgentController {
         main.post(() -> {
             synchronized (AgentController.this) {
                 if (epoch != presentationEpoch.get()) return;
+                actionGate.close();
                 running = false;
+                pauseRequested = false;
+                pendingQuestion = null;
+                activeTask = null;
+                deferredResume = null;
                 lastStatus = message;
                 if (transcript != null) lastOutput = transcript;
                 publishVisualState(state);
@@ -297,7 +356,7 @@ public final class AgentController {
     private void needsInput(String message) {
         final long epoch = presentationEpoch.get();
         main.post(() -> {
-            if (epoch != presentationEpoch.get() || running) return;
+            if (epoch != presentationEpoch.get() || hasActiveTask()) return;
             lastStatus = message;
             publishVisualState(VisualState.NEEDS_INPUT);
             Listener l = listener;
@@ -305,11 +364,14 @@ public final class AgentController {
         });
     }
     private synchronized long begin() {
-        if (running) return -1;
+        if (hasActiveTask()) return -1;
         long epoch = presentationEpoch.incrementAndGet();
         running = true;
         cancelled = false;
         finishing = false;
+        pauseRequested = false; pendingQuestion = null; turnSettled = false;
+        initialized = false; userSent = false; initializeId = ""; interruptId = "";
+        actionGate.close();
         try { context.startForegroundService(new Intent(context, OverlayService.class)); }
         catch (RuntimeException failure) {
             running = false;
@@ -353,7 +415,7 @@ public final class AgentController {
         runInConversation("", prompt, baseUrl, model, apiKey);
     }
     public void runInConversation(String conversationId, String prompt, String baseUrl, String model, String apiKey) {
-        if (running) return;
+        if (hasActiveTask()) return;
         if (prompt == null || prompt.trim().isEmpty()) { needsInput("先输入要手机完成的事情。"); return; }
         if (!isReady()) { needsInput("请先准备运行环境。"); return; }
         if (!PhoneAccessibilityService.isEnabled()) { needsInput("请先在系统设置中开启 PhoneAgent 无障碍服务。"); return; }
@@ -385,6 +447,7 @@ public final class AgentController {
             needsInput("无法保存任务会话，请检查手机存储后重试。");
             return;
         }
+        activeTask = task;
         final String session = resumeSession;
         task.progress(session.isEmpty() ? "正在连接模型…" : "正在恢复原会话…");
         historyChanged(epoch);
@@ -392,55 +455,278 @@ public final class AgentController {
         worker.execute(() -> runTask(task, prompt.trim(), baseUrl.trim(), model.trim(), apiKey.trim(), session));
     }
 
+    private synchronized void acquireTaskWakeLock() {
+        if (taskWakeLock == null) taskWakeLock = wakeLock();
+    }
+    private synchronized void releaseTaskWakeLock() {
+        if (taskWakeLock != null && taskWakeLock.isHeld()) taskWakeLock.release();
+        taskWakeLock = null;
+    }
+    private void interactionState(VisualState state, String message) {
+        visualState = state; // Synchronous: the input immediately stops accepting duplicate submissions.
+        lastStatus = message;
+        long epoch = presentationEpoch.get();
+        main.post(() -> {
+            if (epoch != presentationEpoch.get() || visualState != state) return;
+            publishVisualState(state);
+            Listener l = listener;
+            if (l != null) { l.onStatus(lastStatus); l.onHistoryChanged(); }
+        });
+    }
+    public void pauseForUser() { pauseForUser(null); }
+    public synchronized void pauseForUser(Runnable afterPhoneIdle) {
+        if (!hasActiveTask() || cancelled || finishing || running && activeTask == null) {
+            if (afterPhoneIdle != null) main.post(afterPhoneIdle);
+            return;
+        }
+        actionGate.close();
+        if (pendingQuestion == null && !pauseRequested) {
+            pauseRequested = true;
+            deferredResume = null;
+            releaseTaskWakeLock();
+            turnSettled = !userSent;
+            interactionState(turnSettled ? VisualState.PAUSED : VisualState.PAUSING,
+                    turnSettled ? "任务已暂停，输入补充后继续。" : "正在暂停，等待当前操作结束…");
+            TaskRun task = activeTask;
+            if (task != null) task.hold(turnSettled ? "paused" : "pausing", lastStatus, null);
+            ClaudeTransport channel = transport;
+            if (initialized && userSent && !turnSettled && channel != null) requestInterrupt(channel);
+        }
+        final long epoch = presentationEpoch.get();
+        actionGate.whenIdle(() -> {
+            synchronized (AgentController.this) {
+                if (epoch != presentationEpoch.get() || cancelled) return;
+                if (activeTask != null) settlePauseIfReady(activeTask);
+                historyChanged(epoch);
+            }
+        });
+        if (afterPhoneIdle != null) actionGate.whenIdle(afterPhoneIdle);
+    }
+    private void requestInterrupt(ClaudeTransport channel) {
+        if (!interruptId.isEmpty()) return;
+        interruptAcknowledged = false;
+        interruptId = java.util.UUID.randomUUID().toString();
+        String requestId = interruptId;
+        controls.execute(() -> {
+            try { channel.interrupt(requestId); }
+            catch (IOException failure) { Process child = channel.getProcess(); terminate(child); }
+        });
+    }
+    private void settlePauseIfReady(TaskRun task) {
+        if (pauseRequested && turnSettled && actionGate.isIdle() && (interruptId.isEmpty() || interruptAcknowledged)) {
+            interactionState(VisualState.PAUSED, "任务已暂停，输入补充后继续。");
+            task.hold("paused", lastStatus, null);
+        }
+    }
+    public synchronized void continuePaused(String conversationId, String text, String baseUrl, String model, String apiKey) {
+        if (!canAcceptInput() || pendingQuestion != null || !activeConversationId.equals(conversationId)) return;
+        String correction = text == null ? "" : text.trim();
+        String prompt = correction.isEmpty() ? "用户确认继续原任务。请重新读取手机当前界面再决定下一步。"
+                : "用户暂停任务并补充了要求：\n" + correction + "\n请依据此要求继续原任务，先重新读取手机当前界面，不要复用暂停前的坐标。";
+        resumeInteraction(prompt, correction.isEmpty() ? "继续原任务" : correction, null, null, baseUrl, model, apiKey);
+    }
+    public synchronized void answerQuestion(String conversationId, String requestId, JSONObject answers, String freeText,
+                                            String baseUrl, String model, String apiKey) {
+        if (!canAcceptInput() || pendingQuestion == null || !activeConversationId.equals(conversationId)
+                || !pendingQuestion.optString("id").equals(requestId)) return;
+        JSONObject question = copy(pendingQuestion);
+        JSONObject input = question.optJSONObject("input");
+        JSONArray questions = input == null ? null : input.optJSONArray("questions");
+        if (questions == null || questions.length() == 0) return;
+        JSONObject validated = new JSONObject();
+        StringBuilder description = new StringBuilder();
+        String extra = freeText == null ? "" : freeText.trim();
+        try {
+            for (int i = 0; i < questions.length(); i++) {
+                String key = questions.getJSONObject(i).getString("question");
+                String answer = answers == null ? "" : answers.optString(key).trim();
+                if (answer.isEmpty() && questions.length() == 1) { answer = extra; extra = ""; }
+                if (answer.isEmpty() || answer.length() > 8000) return;
+                validated.put(key, answer);
+                if (description.length() > 0) description.append("\n");
+                description.append(key).append("：").append(answer);
+            }
+            if (!extra.isEmpty()) {
+                String key = questions.getJSONObject(questions.length() - 1).getString("question");
+                validated.put(key, validated.getString(key) + "\n用户补充：" + extra);
+                description.append("\n补充：").append(extra);
+            }
+        } catch (Exception invalid) { return; }
+        if (description.length() > 8000) return;
+        String prompt = "上次任务暂停等待用户回答。以下是原问题和用户回答，请据此继续原任务：\n" + description;
+        resumeInteraction(prompt, description.toString(), question, validated, baseUrl, model, apiKey);
+    }
+    /** Called under the Controller lock; queued until the task UI is actually hidden. */
+    private void resumeInteraction(String prompt, String answer, JSONObject question, JSONObject answers,
+                                   String baseUrl, String model, String apiKey) {
+        if (process == null && (!isReady() || baseUrl == null || model == null || apiKey == null
+                || model.trim().isEmpty() || apiKey.trim().isEmpty())) return;
+        final ClaudeTransport channel = transport;
+        final TaskRun task;
+        try {
+            if (activeTask == null) activeTask = restoreTask(apiKey, baseUrl);
+            task = activeTask;
+            if (task == null) return;
+            if (channel == null && (!LinuxRuntime.isSessionId(task.sessionId) || !runtime.hasClaudeSession(task.sessionId))) {
+                interactionState(visualState, "原会话文件不可用，无法继续；你仍可结束此任务。");
+                return;
+            }
+        } catch (Exception unavailable) { return; }
+        interactionState(VisualState.RESUMING, "正在继续原任务…");
+        task.recordAnswer(answer);
+        task.hold("resuming", lastStatus, question);
+        Runnable resume = () -> {
+            synchronized (AgentController.this) {
+                if (cancelled || visualState != VisualState.RESUMING) return;
+                if (question != null && (pendingQuestion == null
+                        || !question.optString("id").equals(pendingQuestion.optString("id")))) return;
+                pauseRequested = false; pendingQuestion = null; turnSettled = false; interruptId = "";
+                task.hold("running", "正在继续原任务…", null);
+                actionGate.open();
+                interactionState(VisualState.THINKING, "正在继续原任务…");
+                running = true;
+                try {
+                    acquireTaskWakeLock();
+                    if (channel != null && channel == transport && channel.getProcess().isAlive()) {
+                        boolean firstUser = !userSent;
+                        userSent = true;
+                        if (question != null) channel.answerQuestion(question.optString("id"), question.optJSONObject("input"), answers);
+                        else channel.sendUser(firstUser ? "原任务：" + task.prompt + "\n" + prompt : prompt);
+                    } else {
+                        initialized = false; userSent = false;
+                        worker.execute(() -> runTask(task, prompt, baseUrl.trim(), model.trim(), apiKey.trim(), task.sessionId));
+                    }
+                } catch (Exception unavailable) {
+                    pauseRequested = true; turnSettled = true;
+                    pendingQuestion = copy(question);
+                    actionGate.close(); releaseTaskWakeLock();
+                    interactionState(question == null ? VisualState.PAUSED : VisualState.WAITING_USER,
+                            "继续失败，连接已中断；输入内容和任务记录已保留。");
+                    task.hold(question == null ? "paused" : "waiting_user", lastStatus, question);
+                    if (process != null) terminate(process);
+                }
+            }
+        };
+        dispatchWhenHidden(resume);
+    }
+    private TaskRun restoreTask(String key, String endpoint) throws Exception {
+        JSONObject conversation = historyStore.getConversation(activeConversationId);
+        JSONArray turns = conversation == null ? null : conversation.optJSONArray("turns");
+        if (turns == null || turns.length() == 0) return null;
+        JSONObject turn = turns.getJSONObject(turns.length() - 1);
+        JSONObject started = new JSONObject().put("conversation_id", activeConversationId)
+                .put("turn_id", turn.getString("id")).put("session_id", conversation.optString("session_id"))
+                .put("started_at", turn.getLong("started_at"));
+        TaskRun task = new TaskRun(presentationEpoch.get(), key == null ? "" : key, endpoint == null ? "" : endpoint,
+                started, turn.optString("prompt"));
+        task.processText = turn.optString("process"); task.finalResult = turn.optString("result");
+        task.interactionAnswer = turn.optString("interaction_answer");
+        task.pending = copy(pendingQuestion); task.storedState = pendingQuestion == null ? "paused" : "waiting_user";
+        task.rebuildOutput();
+        return task;
+    }
     private void runTask(TaskRun task, String prompt, String baseUrl, String model, String apiKey, String resumeSession) {
         long epoch = task.epoch;
-        PowerManager.WakeLock lock = null;
         boolean ok = false, sawResult = false;
         Integer exitCode = null, turns = null;
-        String reason = "cli_no_result", detail = "执行进程结束，但没有返回最终结果。";
-        String errorCategory = "";
+        String reason = "cli_no_result", detail = "执行连接中断，没有收到最终结果。", errorCategory = "";
         Process child = null;
         PhoneToolServer server = null;
+        ClaudeTransport channel = null;
         try {
-            lock = wakeLock();
+            synchronized (this) { if (!isSuspended()) acquireTaskWakeLock(); }
             if (cancelled) throw new CancellationException();
             server = new PhoneToolServer(new PhoneToolServer.Observer() {
                 @Override public void onTool(String name) {
-                    if (cancelled) return;
+                    if (cancelled || isSuspended()) return;
                     String label = "正在操作手机：" + toolLabel(name);
-                    task.progress(label);
-                    phase(epoch, VisualState.ACTING, label);
+                    task.progress(label); phase(epoch, VisualState.ACTING, label);
                 }
-                @Override public void onToolFinished(String name) {
-                    phase(epoch, VisualState.THINKING, "正在思考下一步…");
-                }
-            });
+                @Override public void onToolFinished(String name) { phase(epoch, VisualState.THINKING, "正在思考下一步…"); }
+            }, actionGate);
             bridge = server;
             if (cancelled) throw new CancellationException();
-            child = runtime.startClaude(prompt, baseUrl, model, apiKey, server.port(), server.token(), resumeSession);
-            process = child;
-            if (cancelled) { terminate(child); throw new CancellationException(); }
+            channel = runtime.startInteractiveClaude(baseUrl, model, apiKey, server.port(), server.token(), resumeSession);
+            child = channel.getProcess();
+            synchronized (this) {
+                transport = channel; process = child;
+                initializeId = java.util.UUID.randomUUID().toString();
+            }
+            if (cancelled) throw new CancellationException();
+            channel.initialize(initializeId);
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(child.getInputStream(), "UTF-8"))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     if (cancelled) break;
                     JSONObject event;
                     try { event = new JSONObject(line); }
-                    catch (Exception notJson) {
-                        // Diagnostics may contain request bodies. Keep only a controlled phase label.
-                        if (!line.trim().isEmpty()) task.diagnostic();
-                        continue;
-                    }
+                    catch (Exception notJson) { if (!line.trim().isEmpty()) task.diagnostic(); continue; }
                     String type = event.optString("type");
-                    if (type.equals("result") || (type.equals("system") && event.optString("subtype").equals("init"))) {
+                    if (type.equals("result") || type.equals("system") && event.optString("subtype").equals("init"))
                         task.captureSession(event.optString("session_id"), resumeSession);
-                    }
-                    if (type.equals("assistant")) {
+                    if (type.equals("control_response")) {
+                        JSONObject response = event.optJSONObject("response");
+                        if (response != null && initializeId.equals(response.optString("request_id"))) {
+                            if (!"success".equals(response.optString("subtype"))) throw new IOException("Claude initialization failed");
+                            synchronized (this) {
+                                initialized = true;
+                                if (!pauseRequested && !cancelled && !userSent) {
+                                    final ClaudeTransport readyChannel = channel;
+                                    dispatchWhenHidden(() -> {
+                                        if (cancelled || pauseRequested || userSent || readyChannel != transport) return;
+                                        try {
+                                            actionGate.open(); userSent = true;
+                                            readyChannel.sendUser(prompt);
+                                        } catch (IOException unavailable) { terminate(readyChannel.getProcess()); }
+                                    });
+                                } else if (pauseRequested) settlePauseIfReady(task);
+                            }
+                        } else if (response != null && !interruptId.isEmpty()
+                                && interruptId.equals(response.optString("request_id"))) {
+                            synchronized (this) {
+                                if (!"success".equals(response.optString("subtype"))) throw new IOException("Claude interrupt failed");
+                                interruptAcknowledged = true;
+                                settlePauseIfReady(task);
+                            }
+                        }
+                    } else if (type.equals("control_request")) {
+                        JSONObject request = event.optJSONObject("request");
+                        String requestId = event.optString("request_id");
+                        if (request != null && "can_use_tool".equals(request.optString("subtype"))) {
+                            JSONObject input = request.optJSONObject("input");
+                            JSONArray questions = input == null ? null : input.optJSONArray("questions");
+                            JSONObject candidate = new JSONObject().put("id", requestId).put("kind", "question").put("input", copy(input));
+                            boolean validQuestion = true;
+                            try { LastTaskStore.copyInteraction(new JSONObject().put("pending_question", candidate), new JSONObject()); }
+                            catch (IOException invalid) { validQuestion = false; }
+                            synchronized (this) {
+                                if (validQuestion && !pauseRequested && pendingQuestion == null && "AskUserQuestion".equals(request.optString("tool_name"))
+                                        && questions != null && questions.length() > 0 && questions.length() <= 4
+                                        && input.toString().length() <= 16000) {
+                                    actionGate.close(); releaseTaskWakeLock();
+                                    pendingQuestion = candidate;
+                                    interactionState(VisualState.WAITING_USER, "月薪喵有问题需要你确认，回答后继续。");
+                                    task.hold("waiting_user", lastStatus, pendingQuestion);
+                                    actionGate.whenIdle(() -> historyChanged(epoch));
+                                } else channel.denyTool(requestId, pauseRequested ? "用户已暂停任务，请等待新的用户输入。" : "此工具未开放或问题格式无效。");
+                            }
+                        }
+                    } else if (type.equals("control_cancel_request")) {
+                        synchronized (this) {
+                            if (pendingQuestion != null && pendingQuestion.optString("id").equals(event.optString("request_id"))) {
+                                pendingQuestion = null; pauseRequested = true; deferredResume = null;
+                                turnSettled = false;
+                                actionGate.close(); releaseTaskWakeLock();
+                                interactionState(VisualState.PAUSING, "原问题已取消，正在暂停任务…");
+                                task.hold("pausing", lastStatus, null);
+                                requestInterrupt(channel);
+                            }
+                        }
+                    } else if (type.equals("assistant")) {
                         JSONObject msg = event.optJSONObject("message");
                         JSONArray content = msg == null ? null : msg.optJSONArray("content");
                         if (event.has("error") && !event.isNull("error")) {
-                            errorCategory = knownErrorCategory(event.optString("error"));
-                            task.progress("模型服务报告错误，正在等待执行结果。"); continue;
+                            errorCategory = knownErrorCategory(event.optString("error")); task.diagnostic(); continue;
                         }
                         if (content != null) for (int i = 0; i < content.length(); i++) {
                             JSONObject part = content.optJSONObject(i);
@@ -451,62 +737,68 @@ public final class AgentController {
                             }
                         }
                     } else if (type.equals("result")) {
+                        synchronized (this) {
+                            turnSettled = true;
+                            if (pauseRequested || pendingQuestion != null) {
+                                releaseTaskWakeLock();
+                                if (pendingQuestion == null) {
+                                    settlePauseIfReady(task);
+                                }
+                                continue;
+                            }
+                            actionGate.close();
+                            finishing = true; // A later cat click must not reopen an already completed turn.
+                        }
                         sawResult = true;
                         turns = LastTaskStore.optionalInt(event, "num_turns");
                         String subtype = event.optString("subtype", "success");
                         ok = !event.optBoolean("is_error", false) && "success".equals(subtype);
                         reason = ok ? "success" : "error_result";
                         detail = ok ? "执行进程已返回最终结果。" : resultFailure(event, subtype, errorCategory);
-                        // Error arrays and raw error results can include provider request bodies.
                         if (ok) task.appendResult(event.optString("result", ""));
+                        break; // Interactive CLI deliberately keeps stdin open after a turn.
                     } else if (type.equals("system") && event.optString("subtype").equals("init")) {
-                        task.progress("模型已连接，正在处理任务…");
-                    } else if (type.equals("error")) {
-                        task.progress("执行进程报告错误，正在等待最终结果。");
+                        if (!isSuspended()) task.progress("模型已连接，正在处理任务…");
                     }
                 }
-            }
-            exitCode = child.waitFor();
-            if (!sawResult) { ok = false; reason = "cli_no_result"; }
-            else if (ok && exitCode != 0) {
-                ok = false;
-                reason = "cli_exit_error";
-                detail = "执行进程异常退出。";
             }
         } catch (Exception failure) {
             ok = false;
             if (failure instanceof LinuxRuntime.MissingSessionException) {
-                reason = "session_missing";
-                detail = "原会话文件已丢失，无法继续；没有创建新会话。";
+                reason = "session_missing"; detail = "原会话文件已丢失，无法继续；没有创建新会话。";
             } else if (failure instanceof SessionMismatchException) {
-                reason = "session_mismatch";
-                detail = "执行进程返回的会话与原会话不符，已停止执行。";
-            } else if (!sawResult) {
-                reason = "cli_no_result";
-                detail = child == null ? "执行进程未能启动，没有返回最终结果。" : "执行连接中断，没有收到最终结果。";
-            } else {
-                reason = "execution_error";
-                detail = "收到模型结果后，执行进程发生异常。";
+                reason = "session_mismatch"; detail = "执行进程返回的会话与原会话不符，已停止执行。";
             }
         } finally {
+            synchronized (this) { initialized = false; }
+            if (child != null) captureChild(child);
             if (server != null) server.close();
-            bridge = null;
+            if (channel != null) try { channel.close(); } catch (IOException ignored) { }
             if (child != null) {
-                if (child.isAlive()) terminate(child);
-                try { exitCode = child.exitValue(); } catch (IllegalThreadStateException stillStopping) { }
+                boolean alreadyExited = !child.isAlive();
+                terminate(child); // Retained descendant fingerprints also cover an already-exited tracer.
+                if (alreadyExited) try { exitCode = child.exitValue(); } catch (IllegalThreadStateException ignored) { }
             }
-            process = null;
-            if (lock != null && lock.isHeld()) lock.release();
+            synchronized (this) {
+                bridge = null; process = null; transport = null; initialized = false;
+                releaseTaskWakeLock();
+            }
         }
         synchronized (this) {
-            // Once completion is being saved, a late Stop cannot change only half of its outcome.
+            if (!cancelled && isSuspended() && !reason.equals("session_mismatch")) {
+                running = false; turnSettled = true;
+                // The next explicit input uses --resume. No automatic model call on process death/restart.
+                interactionState(pendingQuestion == null ? VisualState.PAUSED : VisualState.WAITING_USER,
+                        "执行连接已关闭，任务已保留；确认继续时将恢复原会话。");
+                task.hold(pendingQuestion == null ? "paused" : "waiting_user", lastStatus, pendingQuestion);
+                return;
+            }
             finishing = true;
             if (cancelled) { ok = false; reason = "user_stop"; detail = "用户手动停止了任务。"; }
         }
         if (!cancelled && !sawResult && !resumeSession.isEmpty() && !task.sessionConfirmed
                 && !reason.equals("session_missing") && !reason.equals("session_mismatch")) {
-            reason = "resume_failed";
-            detail = "原会话未能恢复，执行进程没有返回最终结果；没有创建新会话。";
+            reason = "resume_failed"; detail = "原会话未能恢复，执行进程没有返回最终结果；没有创建新会话。";
         }
         if (!cancelled && !sawResult && !errorCategory.isEmpty()) detail += "\n错误类别：" + errorCategory;
         String state = cancelled ? "stopped" : ok ? "success" : "error";
@@ -520,7 +812,8 @@ public final class AgentController {
         final long epoch, startedAt;
         final String key, endpoint, conversationId, turnId, prompt;
         String transcript = "", processText = "", finalResult = "", terminalText = "", sessionId;
-        String status = "正在连接模型…";
+        String status = "正在连接模型…", storedState = "running", interactionAnswer = "";
+        JSONObject pending;
         boolean done, sawDiagnostic, saveFailed, sessionConfirmed;
         TaskRun(long epoch, String key, String endpoint, JSONObject started, String prompt) throws Exception {
             this.epoch = epoch; this.key = key; this.endpoint = endpoint;
@@ -539,10 +832,10 @@ public final class AgentController {
             if (normalized.equals(sessionId)) return;
             historyStore.bindSession(conversationId, normalized);
             sessionId = normalized;
-            save("running", "", null, null, 0);
+            save(storedState, "", null, null, 0);
         }
         synchronized void progress(String message) {
-            if (done) return;
+            if (done || !storedState.equals("running")) return;
             status = message;
             append("【进度】" + message);
         }
@@ -559,18 +852,29 @@ public final class AgentController {
                     processText = processText.substring(0, processText.length() - finalResult.length() - 2);
             }
             rebuildOutput();
-            save("running", "", null, null, 0);
+            save(storedState, "", null, null, 0);
             output(epoch, transcript);
         }
         synchronized void append(String text) {
             if (done || text == null || text.isEmpty()) return;
             processText = LastTaskStore.tail(processText + (processText.isEmpty() ? "" : "\n\n") + redact(text));
             rebuildOutput();
-            save("running", "", null, null, 0);
+            save(storedState, "", null, null, 0);
             output(epoch, transcript);
+        }
+        synchronized void hold(String state, String message, JSONObject question) {
+            if (done) return;
+            storedState = state; status = message; pending = copy(question);
+            save(state, "", null, null, 0);
+        }
+        synchronized void recordAnswer(String answer) {
+            interactionAnswer = interactionAnswer + (interactionAnswer.isEmpty() ? "" : "\n\n") + redact(answer);
+            if (interactionAnswer.length() > 8000) interactionAnswer = interactionAnswer.substring(interactionAnswer.length() - 8000);
+            append("【用户补充】" + answer);
         }
         synchronized String finish(String state, String message, String reason, String detail, Integer exit, Integer turns) {
             done = true;
+            pending = null; storedState = state;
             status = message;
             String label = state.equals("success") ? "完成" : state.equals("stopped") ? "已停止" : "未完成";
             terminalText = redact(LastTaskStore.terminalFooter(label, detail, exit, turns));
@@ -600,6 +904,8 @@ public final class AgentController {
                         .put("status", redact(status)).put("output", transcript).put("reason", reason)
                         .put("conversation_id", conversationId).put("turn_id", turnId).put("session_id", sessionId)
                         .put("started_at", startedAt).put("updated_at", System.currentTimeMillis()).put("ended_at", ended);
+                record.put("pending_question", pending == null ? JSONObject.NULL : new JSONObject(redact(pending.toString())));
+                record.put("interaction_answer", interactionAnswer);
                 if (exit != null) record.put("exit_code", exit);
                 if (turns != null) record.put("num_turns", turns);
                 try { taskStore.write(record); } catch (IOException unavailable) { saveFailed = true; }
@@ -615,7 +921,9 @@ public final class AgentController {
 
     private static final class SessionMismatchException extends IOException { }
     private static String redactText(String text, String key, String endpoint) {
-        String safe = text.replace(key, "[已隐藏]").replace(endpoint, "[服务地址已隐藏]");
+        String safe = text;
+        if (key != null && !key.isEmpty()) safe = safe.replace(key, "[已隐藏]");
+        if (endpoint != null && !endpoint.isEmpty()) safe = safe.replace(endpoint, "[服务地址已隐藏]");
         return safe.replaceAll("(?i)((?:proxy-)?authorization[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\r\\n\\\"'}]+", "$1[已隐藏]")
                 .replaceAll("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]+", "$1[已隐藏]")
                 .replaceAll("(?i)((?:x-api-key|api[_-]?key)\\s*[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\s,;\\\"'}]+", "$1[已隐藏]");
@@ -624,9 +932,23 @@ public final class AgentController {
     public void stop() {
         final long epoch;
         synchronized (this) {
-            if (!running || cancelled || finishing) return;
+            if (!hasActiveTask() || cancelled || finishing) return;
             epoch = presentationEpoch.get();
             cancelled = true;
+            deferredResume = null;
+            actionGate.close();
+            releaseTaskWakeLock();
+            if (!running) {
+                try {
+                    if (activeTask == null) activeTask = restoreTask("", "");
+                    String transcript = activeTask == null ? lastOutput : activeTask.finish("stopped", "已停止任务，记录已保留。",
+                            "user_stop", "用户手动停止了任务。", null, null);
+                    finished(epoch, VisualState.STOPPED, false, "已停止任务，记录已保留。", transcript);
+                } catch (Exception unavailable) {
+                    finished(epoch, VisualState.STOPPED, false, "已停止任务，记录暂时无法保存。", lastOutput);
+                }
+                return;
+            }
         }
         main.post(() -> {
             if (epoch != presentationEpoch.get() || !running) return;
@@ -635,27 +957,36 @@ public final class AgentController {
             Listener l = listener;
             if (l != null) l.onStatus(lastStatus);
         });
-        runtime.cancel();
         PhoneToolServer server = bridge;
         if (server != null) server.close();
         Process child = process;
-        if (child != null) {
-            // Bound cancellation cleanup, not task duration. Never block the main/UI thread.
-            Thread cleanup = new Thread(() -> terminate(child), "phone-agent-stop");
+        ClaudeTransport channel = transport;
+        if (child != null && channel != null) {
+            Thread cleanup = new Thread(() -> {
+                captureChild(child);
+                // Cancel the native question/turn before EOF so Claude does not interpret
+                // a closed permission channel as an unanswered tool to retry.
+                try { channel.interrupt(); } catch (IOException ignored) { }
+                try { channel.close(); } catch (IOException ignored) { }
+                terminate(child);
+            }, "phone-agent-stop");
             cleanup.setDaemon(true);
             cleanup.start();
+        } else runtime.cancel(); // Also invalidates a launch that has not registered its child yet.
+    }
+    private static void captureChild(Process child) {
+        for (;;) {
+            try { ProcessLifecycle.capture(child); return; }
+            catch (ProcessLifecycle.CleanupException waiting) { android.os.SystemClock.sleep(1000); }
         }
     }
     private static void terminate(Process child) {
-        child.destroy();
-        try {
-            if (!child.waitFor(1500, TimeUnit.MILLISECONDS)) {
-                child.destroyForcibly();
-                child.waitFor(1500, TimeUnit.MILLISECONDS);
-            }
-        } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); child.destroyForcibly(); }
-        try { child.getInputStream().close(); } catch (IOException ignored) { }
+        for (;;) {
+            try { ProcessLifecycle.terminate(child); return; }
+            catch (ProcessLifecycle.CleanupException waiting) { android.os.SystemClock.sleep(1000); }
+        }
     }
+    private static int childPid(Process child) { return ProcessLifecycle.pid(child); }
     private static String resultFailure(JSONObject event, String subtype, String category) {
         String detail;
         if ("error_max_turns".equals(subtype)) detail = "执行进程报告达到轮数限制。";

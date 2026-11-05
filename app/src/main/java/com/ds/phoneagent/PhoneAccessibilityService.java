@@ -9,6 +9,7 @@ import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
@@ -58,29 +59,93 @@ public final class PhoneAccessibilityService extends AccessibilityService {
 
     /** Call from a worker thread; gesture results reflect the system callback. */
     public static JSONObject execute(String tool, JSONObject arguments) {
+        return execute(tool, arguments, null, -1);
+    }
+
+    /** A captured generation is checked again on the main thread, immediately before dispatch. */
+    static JSONObject execute(String tool, JSONObject arguments, PhoneActionGate gate, long ticket) {
         PhoneAccessibilityService service = connected;
         if (service == null) return error("手机控制服务未开启，请在无障碍设置中启用 PhoneAgent。");
         if (Looper.myLooper() == Looper.getMainLooper()) return error("手机工具必须从工作线程调用。");
-        JSONObject args = arguments == null ? new JSONObject() : arguments;
-        CountDownLatch finished = new CountDownLatch(1);
-        AtomicReference<JSONObject> result = new AtomicReference<>();
-        service.main.post(() -> {
-            try {
-                service.perform(tool, args, value -> {
-                    result.set(value);
-                    finished.countDown();
-                });
-            } catch (Exception exception) {
-                result.set(error(exception.getClass().getSimpleName() + ": " + exception.getMessage()));
+        if (gate != null && !gate.isAllowed(ticket)) return paused();
+        PendingAction action = new PendingAction(service, tool, arguments == null ? new JSONObject() : arguments, gate, ticket);
+        if (!service.main.post(action)) return error("手机控制线程暂时不可用。");
+        try {
+            long remaining = Math.max(0, action.deadline - SystemClock.elapsedRealtime());
+            if (!action.finished.await(remaining, TimeUnit.MILLISECONDS)) {
+                action.cancel(error("等待手机操作结果超时，已取消尚未开始的操作；请重新读取界面确认状态。"));
+            }
+            return action.result.get();
+        } catch (InterruptedException interrupted) {
+            action.cancel(error("手机操作已中断，尚未开始的操作已取消。"));
+            Thread.currentThread().interrupt();
+            return action.result.get();
+        }
+    }
+
+    /** Cancellation and dispatch share a monitor, so a timed-out queued Runnable cannot run later. */
+    private static final class PendingAction implements Runnable {
+        final PhoneAccessibilityService service;
+        final String tool;
+        final JSONObject arguments;
+        final PhoneActionGate gate;
+        final long ticket;
+        final Object lock;
+        final long deadline = SystemClock.elapsedRealtime() + 8000;
+        final CountDownLatch finished = new CountDownLatch(1);
+        final AtomicReference<JSONObject> result = new AtomicReference<>();
+        boolean started, completed, cancelled, tracked;
+
+        PendingAction(PhoneAccessibilityService service, String tool, JSONObject arguments, PhoneActionGate gate, long ticket) {
+            this.service = service;
+            this.tool = tool;
+            this.arguments = arguments;
+            this.gate = gate;
+            this.ticket = ticket;
+            lock = gate == null ? new Object() : gate;
+        }
+
+        @Override public void run() {
+            synchronized (lock) {
+                if (completed || cancelled) return;
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    complete(error("手机操作排队超时，已取消执行。"));
+                    return;
+                }
+                if (connected != service) {
+                    complete(error("手机控制服务已断开，操作未执行。"));
+                    return;
+                }
+                if (gate != null && !gate.begin(ticket)) { complete(paused()); return; }
+                tracked = gate != null;
+                started = true;
+                try { service.perform(tool, arguments, this::complete); }
+                catch (Exception exception) {
+                    complete(error(exception.getClass().getSimpleName() + ": " + exception.getMessage()));
+                }
+            }
+        }
+
+        void cancel(JSONObject reason) {
+            synchronized (lock) {
+                cancelled = true;
+                result.compareAndSet(null, reason);
+                if (!started) complete(reason);
+                else finished.countDown();
+                // A dispatched gesture remains in flight until its real system callback.
+                // A caller timeout must never allow whenIdle() to open UI over that gesture.
+            }
+            service.main.removeCallbacks(this);
+        }
+
+        void complete(JSONObject value) {
+            synchronized (lock) {
+                if (completed) return;
+                completed = true;
+                result.compareAndSet(null, value);
+                if (tracked) { tracked = false; gate.finish(); }
                 finished.countDown();
             }
-        });
-        try {
-            if (!finished.await(8, TimeUnit.SECONDS)) return error("等待手机操作结果超时，请重新读取界面确认状态。");
-            return result.get();
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            return error("手机操作已中断。");
         }
     }
 
@@ -242,6 +307,11 @@ public final class PhoneAccessibilityService extends AccessibilityService {
     private static JSONObject error(String message) {
         JSONObject result = new JSONObject();
         try { result.put("ok", false); result.put("error", message); } catch (Exception ignored) { }
+        return result;
+    }
+    private static JSONObject paused() {
+        JSONObject result = error("任务已暂停，当前手机操作未执行；请等待用户回答或继续任务。");
+        try { result.put("error_code", "task_paused"); } catch (Exception ignored) { }
         return result;
     }
 }

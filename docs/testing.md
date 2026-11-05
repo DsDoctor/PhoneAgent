@@ -2,7 +2,7 @@
 
 ## 日常界面改动
 
-手机连接 USB、解锁，确认没有任务执行，关闭 App 中未保存的连接配置编辑页。在项目目录运行：
+手机连接 USB、解锁，确认没有正在执行或等待处理的任务，关闭 App 中未保存的连接配置编辑页。在项目目录运行：
 
 ```bash
 python3 scripts/regress-ui.py
@@ -45,6 +45,16 @@ python3 scripts/regress-ui.py --adb /path/to/adb --timeout 300
 ```
 
 需要 Python 3.9+、ADB，以及允许 `run-as` 的当前调试签名安装包。无障碍需已正常开启；脚本不会代替用户重新授权。原页面恢复到顶部，不保证保留原先精确的滚动偏移。
+
+## 反问与暂停回归
+
+安装新 App 及 `scripts/build_android_tests.py` 生成的测试包后运行：
+
+```bash
+python3 scripts/test-interaction.py --serial DEVICE_SERIAL
+```
+
+它有 240 秒总预算，使用本机固定响应服务和真实 Claude Code，测试 HOME、任务记录和记忆均放在独立缓存目录。测试前后核对真实历史、加密配置和 Linux 用户目录文件摘要；不读取配置密钥、不调用外部模型。运行前手机应空闲且没有暂停或待回答任务。该专项会重启 App 并重新绑定无障碍服务，与日常 UI 快检的影响不同。
 
 ## 其他测试分层
 

@@ -32,6 +32,7 @@ KNOWN = {tool["name"] for tool in TOOLS}
 ROUTINE_NAMES = {tool["name"] for tool in ROUTINE_TOOLS}
 BRIDGE_TOOLS = {"read_screen", "home", "back", "open_settings", "open_app", "tap", "swipe", "type_text"}
 _ROUTINE_STORE = None
+_ACTION_CONTEXT = threading.local()
 POLL_SECONDS = 0.5
 STABLE_SECONDS = 1.0
 DAMAI_SPLASH_IDS = frozenset({
@@ -45,7 +46,25 @@ class WaitBudgetExpired(Exception):
     pass
 
 
+class ActionPaused(Exception):
+    pass
+
+
 def invoke(name, arguments):
+    # One MCP tool may make many HTTP calls. Keep its first gate generation even
+    # across local polling/settle sleeps; a resume must not revive old steps.
+    _ACTION_CONTEXT.active = True
+    _ACTION_CONTEXT.epoch = None
+    _ACTION_CONTEXT.blocked = False
+    try:
+        return invoke_in_context(name, arguments)
+    finally:
+        _ACTION_CONTEXT.active = False
+        _ACTION_CONTEXT.epoch = None
+        _ACTION_CONTEXT.blocked = False
+
+
+def invoke_in_context(name, arguments):
     if name not in KNOWN:
         raise ValueError("Unknown phone tool")
     store = get_routine_store()
@@ -96,7 +115,14 @@ def invoke_bridge(name, arguments, timeout=15):
     """One existing Android bridge action; composite tools never reach the bridge."""
     if name not in BRIDGE_TOOLS:
         raise ValueError("Unknown Android bridge tool")
-    data = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False).encode("utf-8")
+    contextual = getattr(_ACTION_CONTEXT, "active", False)
+    if contextual and getattr(_ACTION_CONTEXT, "blocked", False):
+        return {"ok": False, "error_code": "task_paused", "error": "任务已暂停或执行状态已改变；旧操作不会继续。"}
+    expected_epoch = getattr(_ACTION_CONTEXT, "epoch", None) if contextual else None
+    request_body = {"name": name, "arguments": arguments}
+    if expected_epoch is not None:
+        request_body["action_epoch"] = expected_epoch
+    data = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
     port = int(os.environ["PHONE_AGENT_PORT"])
     headers = {"Authorization": "Bearer " + os.environ["PHONE_AGENT_TOKEN"], "Content-Type": "application/json"}
     # Connect directly to loopback: never use an ambient proxy or follow redirects.
@@ -144,6 +170,17 @@ def invoke_bridge(name, arguments, timeout=15):
         raise value
     if not isinstance(value, dict):
         raise ValueError("Invalid Android bridge response")
+    if contextual:
+        epoch = value.get("action_epoch")
+        # Legacy local fixtures omit the field. Once a real epoch is established,
+        # a missing/malformed/different epoch cannot be silently accepted.
+        mismatch = expected_epoch is not None and (type(epoch) is not int or epoch != expected_epoch)
+        invalid = "action_epoch" in value and (type(epoch) is not int or epoch <= 0)
+        if value.get("error_code") == "task_paused" or mismatch or invalid:
+            _ACTION_CONTEXT.blocked = True
+            return {"ok": False, "error_code": "task_paused", "error": "任务已暂停或执行状态已改变；旧操作不会继续。"}
+        if expected_epoch is None and type(epoch) is int and epoch > 0:
+            _ACTION_CONTEXT.epoch = epoch
     return value
 
 
@@ -213,7 +250,10 @@ def open_app_ready(arguments):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise WaitBudgetExpired()
-        return invoke_bridge(name, values, timeout=remaining)
+        value = invoke_bridge(name, values, timeout=remaining)
+        if value.get("error_code") == "task_paused":
+            raise ActionPaused()
+        return value
 
     try:
         launch = bridge_call("open_app", {"package_name": package_name})
@@ -246,6 +286,10 @@ def open_app_ready(arguments):
             if remaining > 0:
                 time.sleep(min(POLL_SECONDS, remaining))
         return finish("blocked", last_reason, "等待已到时限，尚未确认应用就绪；请查看最后 screen 决定下一步。")
+    except ActionPaused:
+        result = finish("error", "task_paused", "任务已暂停或执行状态已改变，已停止旧的应用等待流程。")
+        result["error_code"] = "task_paused"
+        return result
     except WaitBudgetExpired:
         return finish("blocked", last_reason, "等待已到时限，尚未确认应用就绪；请查看最后 screen 决定下一步。")
     except urllib.error.HTTPError as exc:

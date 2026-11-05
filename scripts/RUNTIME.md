@@ -42,7 +42,11 @@ PRoot 和 loader 从 App 的 `nativeLibraryDir` 启动。构建时必须设置 `
 
 `LinuxRuntime` 用 PRoot 的 UID/GID 映射呈现普通用户 1000；它没有 root 权限。用户数据与 Linux 系统文件分开，保存于 App 私有目录。App 退出后台任务后可停止进程，卸载 App 则删除其私有运行时。
 
-模型密钥仅通过进程环境传入 Claude，不写入 Linux 配置文件，也不放入进程命令行。Claude 内置工具关闭，只允许 `phone` MCP 工具，并以 `dontAsk` 权限模式运行；本实现不使用 `--dangerously-skip-permissions`。手机工具桥接由应用层校验随机令牌。
+模型密钥仅通过进程环境传入 Claude，不写入 Linux 配置文件，也不放入进程命令行。生产任务开放 Claude 原生 `Read`、`Write`、`Edit`、`Glob`、`Grep` 和 `AskUserQuestion`，同时保留 `phone` MCP 工具。文件和手机工具预授权；原生反问通过 `--permission-mode default --permission-prompt-tool stdio` 返回 App，由用户明确提交答案。未开放 Bash，也不使用 `--dangerously-skip-permissions`。手机工具桥接校验随机令牌和暂停代次。
+
+任务采用 `--input-format stream-json --output-format stream-json` 双向协议；初始化完成才发送用户消息。暂停先关闭手机动作门，再发送原生 interrupt；等旧轮结束才允许纠正后继续。等待回答时不重复请求模型并释放任务 WakeLock。App 界面退出前不会重新放行手机动作。结束任务先发送原生 interrupt，再关闭输入；退出清理按 PID、启动时间及 UID 追踪本次进程子树，先退出子进程，再退出 PRoot，确认无活跃子进程后才显示结束。
+
+Claude 的 HOME 和工作目录固定为 `/home/agent`，实际保存在手机 App 私有 `files/linux/home/`，与 rootfs 分离。沿用 Claude 原生 `CLAUDE.md` 和 `.claude/projects/-home-agent/memory/MEMORY.md` 自动加载机制，没有另外注入或同步记忆。相同包名与签名的覆盖升级保留该目录；卸载或清除应用数据会删除它。
 
 当前运行时是否能稳定启动，以华为真机上的 `claude --version`、Python MCP 连接和实际任务验证为准；构建成功本身不能证明兼容性。
 

@@ -49,8 +49,11 @@ public final class OverlayService extends Service {
         }
         OverlayService service = instance;
         if (service == null) return;
-        service.petState = value == null ? AgentController.VisualState.IDLE : value;
+        AgentController.VisualState next = value == null ? AgentController.VisualState.IDLE : value;
+        boolean changed = service.petState != next;
+        service.petState = next;
         if (service.bubble != null) service.bubble.setState(service.petState);
+        if (changed) service.updateNotification();
     }
 
     /** Accessibility lifecycle callbacks and Activity callbacks run on the main thread. */
@@ -77,20 +80,37 @@ public final class OverlayService extends Service {
         NotificationChannel channel = new NotificationChannel(CHANNEL, "手机助手", NotificationManager.IMPORTANCE_LOW);
         channel.setDescription("进入手机助手或立即停止当前任务");
         notifications.createNotificationChannel(channel);
+        startForeground(101, notification());
+    }
+
+    private Notification notification() {
         PendingIntent open = PendingIntent.getActivity(this, 1, new Intent(this, MainActivity.class)
+                .setAction(MainActivity.ACTION_EDIT_ACTIVE_TASK)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop = PendingIntent.getService(this, 2, new Intent(this, OverlayService.class)
                 .setAction(ACTION_STOP_TASK), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification notification = new Notification.Builder(this, CHANNEL)
+        String message;
+        switch (petState) {
+            case PAUSING: message = "正在暂停 · 点此查看当前任务"; break;
+            case PAUSED: message = "任务已暂停 · 点此补充或继续"; break;
+            case WAITING_USER: message = "月薪喵在等你回答 · 点此查看问题"; break;
+            case RESUMING: message = "正在继续任务 · 点此暂停并查看"; break;
+            default: message = "点此进入助手 · 执行中进入会暂停任务";
+        }
+        return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.monthly_cat_icon)
                 .setContentTitle("PhoneAgent")
-                .setContentText("点此进入助手 · 可随时停止当前任务")
+                .setContentText(message)
                 .setContentIntent(open)
                 .setOngoing(true)
                 .setShowWhen(false)
-                .addAction(new Notification.Action.Builder(null, "停止任务", stop).build())
+                .setOnlyAlertOnce(true)
+                .addAction(new Notification.Action.Builder(null, "结束任务", stop).build())
                 .build();
-        startForeground(101, notification);
+    }
+
+    private void updateNotification() {
+        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(101, notification());
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -130,6 +150,13 @@ public final class OverlayService extends Service {
         position.x = preferences().getInt("bubble_x", Math.max(0, getResources().getDisplayMetrics().widthPixels - dp(80)));
         position.y = preferences().getInt("bubble_y", dp(190));
         clampPosition();
+        bubble.setOnClickListener(view -> AgentController.get(OverlayService.this).pauseForUser(() ->
+                MAIN.post(() -> {
+                    if (instance != OverlayService.this) return;
+                    startActivity(new Intent(OverlayService.this, MainActivity.class)
+                            .setAction(MainActivity.ACTION_EDIT_ACTIVE_TASK)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+                })));
         bubble.setOnTouchListener(new View.OnTouchListener() {
             private float downX, downY;
             private int startX, startY;
@@ -153,11 +180,7 @@ public final class OverlayService extends Service {
                 }
                 if (event.getActionMasked() == MotionEvent.ACTION_UP) {
                     if (moved) preferences().edit().putInt("bubble_x", position.x).putInt("bubble_y", position.y).apply();
-                    else {
-                        view.performClick();
-                        startActivity(new Intent(OverlayService.this, MainActivity.class)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
-                    }
+                    else view.performClick();
                     return true;
                 }
                 return event.getActionMasked() == MotionEvent.ACTION_CANCEL;

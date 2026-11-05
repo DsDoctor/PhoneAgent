@@ -55,10 +55,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /** Sideload-only test APK. No command receiver is added to the actual app. */
 public final class TestInstrumentation extends Instrumentation {
     private String mode;
+    private String interactionFixtureId;
+    private boolean interactionStopOnly;
     private final StringBuilder report = new StringBuilder();
     private volatile MainActivity resumedMain;
     private volatile boolean mainResumed;
@@ -78,6 +81,9 @@ public final class TestInstrumentation extends Instrumentation {
 
     @Override public void onCreate(Bundle arguments) {
         mode = arguments == null ? "tools" : arguments.getString("mode", "tools");
+        interactionFixtureId = arguments == null ? "" : arguments.getString("fixture_id", "");
+        if (!interactionFixtureId.matches("[0-9a-f]{32}")) interactionFixtureId = UUID.randomUUID().toString().replace("-", "");
+        interactionStopOnly = arguments != null && "stop".equals(arguments.getString("interaction_stage", ""));
         super.onCreate(arguments);
         start();
     }
@@ -114,6 +120,7 @@ public final class TestInstrumentation extends Instrumentation {
             else if ("markdown".equals(mode)) markdown();
             else if ("delete".equals(mode)) deleteHistory();
             else if ("historyui".equals(mode)) historyUi();
+            else if ("interaction".equals(mode)) interaction();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -1010,6 +1017,428 @@ public final class TestInstrumentation extends Instrumentation {
         };
     }
 
+    /** Real native transport, but fixture-only credentials and entirely disposable Linux HOME/history. */
+    private void interaction() throws Exception {
+        awaitInteraction(() -> PhoneAccessibilityService.isEnabled(), 15000, "PhoneAgent accessibility did not bind");
+        AgentController userController = AgentController.get(getTargetContext());
+        check(!userController.isRunning() && !userController.hasActiveTask(), "Do not test while a user task is active");
+        check(!interactionFixtureStatus().optBoolean("slow_started"), "Restart the interaction fixture before this mode");
+        File directory = new File(getTargetContext().getCacheDir(), "interaction-smoke-" + interactionFixtureId);
+        check(!directory.exists() && directory.mkdirs(), "Cannot create unique interaction test directory");
+        File historyDirectory = new File(directory, "history");
+        File recoveryDirectory = new File(directory, "recovery");
+        File stopRecoveryDirectory = new File(directory, "stop-recovery");
+        LinuxRuntime runtime = new LinuxRuntime(getTargetContext(), new File(getTargetContext().getFilesDir(), "linux/rootfs"),
+                new File(directory, "runtime"));
+        LinuxRuntime recoveryRuntime = new LinuxRuntime(getTargetContext(), new File(getTargetContext().getFilesDir(), "linux/rootfs"),
+                new File(directory, "recovery-runtime"));
+        check(runtime.isInstalled(), "Prepare the installed runtime before mode=interaction; this mode never installs it");
+        AgentController controller = new AgentController(isolatedFilesContext(historyDirectory), runtime);
+        AgentController restored = null;
+        AgentController stoppedRecovery = null;
+        List<String> changedModelKeys = new CopyOnWriteArrayList<>();
+        SharedPreferences settings = getTargetContext().getSharedPreferences("phoneagent", Context.MODE_PRIVATE);
+        SharedPreferences.OnSharedPreferenceChangeListener observer = (preferences, key) -> {
+            if (key == null || key.equals("base_url") || key.equals("model") || key.equals("key_ciphertext") || key.equals("key_iv"))
+                changedModelKeys.add(key == null ? "<clear>" : key);
+        };
+        settings.registerOnSharedPreferenceChangeListener(observer);
+        try {
+            assertCancelledRuntimeRegistration(runtime);
+            if (interactionStopOnly) {
+                assertLiveQuestionStop(controller);
+                return;
+            }
+            PhoneActionGate isolatedGate = new PhoneActionGate();
+            isolatedGate.open();
+            long generation = isolatedGate.capture();
+            check(isolatedGate.isAllowed(generation), "Opened test gate rejected its current action ticket");
+            // Model an action captured before pause but not yet dispatched on Android's main thread.
+            Class<?> pendingActionClass = Class.forName("com.ds.phoneagent.PhoneAccessibilityService$PendingAction");
+            Constructor<?> actionConstructor = pendingActionClass.getDeclaredConstructor(PhoneAccessibilityService.class,
+                    String.class, JSONObject.class, PhoneActionGate.class, long.class);
+            actionConstructor.setAccessible(true);
+            Object service = accessibleField(PhoneAccessibilityService.class, "connected").get(null);
+            Object queued = actionConstructor.newInstance(service, "read_screen", new JSONObject(), isolatedGate, generation);
+            isolatedGate.close(); isolatedGate.open();
+            check(!isolatedGate.isAllowed(generation) && isolatedGate.isAllowed(isolatedGate.capture()),
+                    "Reopened gate revived a stale action generation or rejected its new generation");
+            runOnMainSync((Runnable) queued);
+            AtomicReference<?> queuedResult = (AtomicReference<?>) accessibleField(pendingActionClass, "result").get(queued);
+            JSONObject rejected = (JSONObject) queuedResult.get();
+            check(rejected != null && !rejected.optBoolean("ok") && "task_paused".equals(rejected.optString("error_code")),
+                    "An already queued old-generation action executed after the gate reopened");
+            ControllerProbe questionProbe = new ControllerProbe();
+            startInteraction(controller, questionProbe, "PROBE_ASK");
+            awaitInteraction(() -> controller.getVisualState() == AgentController.VisualState.WAITING_USER
+                            && controller.canAcceptInput() && controller.getPendingQuestion() != null,
+                    120000, "Native question did not reach WAITING_USER");
+            String questionConversationId = controller.getActiveConversationId();
+            JSONObject pending = controller.getPendingQuestion();
+            String pendingId = pending.getString("id");
+            String question = pending.getJSONObject("input").getJSONArray("questions").getJSONObject(0).getString("question");
+            check("Which test color should be remembered?".equals(question), "Native question content was not preserved");
+            JSONObject waitingConversation = controller.getConversation(questionConversationId);
+            String questionSession = waitingConversation.getString("session_id");
+            check(LinuxRuntime.isSessionId(questionSession) && runtime.hasClaudeSession(questionSession),
+                    "Waiting question has no real isolated Claude session");
+            check(controller.hasActiveTask() && questionProbe.finishedCallbacks.get() == 0,
+                    "Waiting for a question prematurely completed the task");
+            AtomicReference<Throwable> uiFailure = new AtomicReference<>();
+            runOnMainSync(() -> {
+                try {
+                    InteractionUiProbe.run(resumedMain, controller, new File(getTargetContext().getCacheDir(),
+                            "interaction-ui-card-" + interactionFixtureId + ".png"));
+                } catch (Throwable failure) { uiFailure.set(failure); }
+            });
+            if (uiFailure.get() != null) throw new AssertionError("Native question UI regression failed", uiFailure.get());
+            waitForIdleSync();
+            log("Native question cards preserved single/multi/free answers, separate drafts, and rotation state without submitting");
+            awaitInteraction(() -> {
+                JSONObject value = new LastTaskStore(historyDirectory).read();
+                return value != null && "waiting_user".equals(value.optString("state"));
+            }, 5000, "WAITING_USER was not persisted");
+            // Snapshot actual saved waiting state before answering; recovery must not invent a question.
+            new TaskHistoryStore(recoveryDirectory).importConversation(waitingConversation);
+            new LastTaskStore(recoveryDirectory).write(new LastTaskStore(historyDirectory).read());
+            new TaskHistoryStore(stopRecoveryDirectory).importConversation(waitingConversation);
+            new LastTaskStore(stopRecoveryDirectory).write(new LastTaskStore(historyDirectory).read());
+            File sourceSession = new File(directory, "runtime/home/.claude/projects/-home-agent/" + questionSession + ".jsonl");
+            File savedSession = new File(directory, "recovery-runtime/home/.claude/projects/-home-agent/" + questionSession + ".jsonl");
+            check(savedSession.getParentFile().mkdirs(), "Could not create recovery-session directory");
+            byte[] sessionSnapshot = readInteractionSession(sourceSession);
+            check(new String(sessionSnapshot, StandardCharsets.UTF_8).contains("AskUserQuestion"),
+                    "Native waiting session did not persist the pending question before snapshot");
+            try (FileOutputStream output = new FileOutputStream(savedSession)) { output.write(sessionSnapshot); }
+            JSONObject answers = new JSONObject().put(question, "Blue");
+            runOnMainSync(() -> controller.answerQuestion(UUID.randomUUID().toString(), pendingId, answers, "",
+                    INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY));
+            check(controller.canAcceptInput() && pendingId.equals(controller.getPendingQuestion().optString("id")),
+                    "Answer from another conversation changed the pending question");
+            runOnMainSync(() -> controller.answerQuestion(questionConversationId, "stale-question-id", answers, "",
+                    INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY));
+            check(controller.canAcceptInput() && pendingId.equals(controller.getPendingQuestion().optString("id")),
+                    "Stale question ID changed the pending question");
+            Process questionProcess = interactionProcess(controller);
+            int beforeAnswerRequests = interactionFixtureStatus().getInt("request_count");
+            runOnMainSync(() -> controller.setTaskUiVisible(true));
+            runOnMainSync(() -> controller.answerQuestion(questionConversationId, pendingId, answers, "",
+                    INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY));
+            check(!controller.canAcceptInput(), "Accepted answer did not close input synchronously");
+            PhoneActionGate questionGate = (PhoneActionGate) accessibleField(AgentController.class, "actionGate").get(controller);
+            waitForIdleSync();
+            SystemClock.sleep(300);
+            check(controller.getVisualState() == AgentController.VisualState.RESUMING
+                            && !questionGate.isAllowed(questionGate.capture())
+                            && beforeAnswerRequests == interactionFixtureStatus().getInt("request_count"),
+                    "Answer resumed execution before its task UI was hidden");
+            java.util.concurrent.ExecutorService controls = (java.util.concurrent.ExecutorService)
+                    accessibleField(AgentController.class, "controls").get(controller);
+            CountDownLatch controlBlocked = new CountDownLatch(1), releaseControls = new CountDownLatch(1);
+            controls.execute(() -> {
+                controlBlocked.countDown();
+                try { releaseControls.await(10, TimeUnit.SECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            });
+            check(controlBlocked.await(5, TimeUnit.SECONDS), "Could not synchronize the UI visibility race");
+            try {
+                runOnMainSync(() -> { controller.setTaskUiVisible(false); controller.setTaskUiVisible(true); });
+            } finally { releaseControls.countDown(); }
+            controls.submit(() -> { }).get(5, TimeUnit.SECONDS);
+            check(controller.getVisualState() == AgentController.VisualState.RESUMING
+                            && !questionGate.isAllowed(questionGate.capture())
+                            && beforeAnswerRequests == interactionFixtureStatus().getInt("request_count"),
+                    "A queued continuation executed after the task UI became visible again");
+            runOnMainSync(() -> controller.setTaskUiVisible(false));
+            awaitInteractionResult(controller, questionProbe, "PROBE_ASK_OK");
+            JSONObject answered = controller.getConversation(questionConversationId);
+            check(questionSession.equals(answered.getString("session_id")), "Answer changed the Claude session");
+            check(questionProcess != null && !questionProcess.isAlive(), "Completed question process was not reaped");
+            check(answered.toString().contains("Blue") && answered.toString().contains("interaction_answer"),
+                    "The submitted answer was not preserved in the task history");
+            check(controller.getPendingQuestion() == null, "Completed question remains pending");
+            log("Native AskUserQuestion waited, rejected unrelated/stale answers, and continued the original session");
+
+            restored = new AgentController(isolatedFilesContext(recoveryDirectory), recoveryRuntime);
+            final AgentController recovered = restored;
+            ControllerProbe recoveryProbe = new ControllerProbe();
+            runOnMainSync(() -> recovered.setListener(recoveryProbe));
+            check(recovered.getVisualState() == AgentController.VisualState.WAITING_USER && recovered.hasActiveTask()
+                            && recovered.canAcceptInput() && !recovered.isRunning(),
+                    "Reconstructed WAITING_USER did not remain a dormant active task");
+            check(interactionProcess(recovered) == null && pendingId.equals(recovered.getPendingQuestion().optString("id")),
+                    "Reconstructed question launched a process or lost its pending request");
+            check(questionSession.equals(recovered.getConversation(questionConversationId).getString("session_id")),
+                    "Reconstructed question lost the original session");
+            int beforeRecoveryRequests = interactionFixtureStatus().getInt("request_count");
+            waitForIdleSync();
+            SystemClock.sleep(300);
+            check(beforeRecoveryRequests == interactionFixtureStatus().getInt("request_count") && interactionProcess(recovered) == null,
+                    "Reconstruction automatically contacted the fixture or resumed execution");
+            runOnMainSync(() -> recovered.answerQuestion(questionConversationId, pendingId, answers, "PROBE_RECOVERED_ANSWER",
+                    INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY));
+            awaitInteractionResult(recovered, recoveryProbe, "PROBE_RECOVERED_ANSWER_OK");
+            check(questionSession.equals(recovered.getConversation(questionConversationId).getString("session_id")),
+                    "Recovered answer created a different CLI session");
+            log("Recovered native pending session resumed with its original question context and explicit user answer");
+
+            stoppedRecovery = new AgentController(isolatedFilesContext(stopRecoveryDirectory), runtime);
+            final AgentController stoppedRestored = stoppedRecovery;
+            runOnMainSync(stoppedRestored::stop);
+            awaitInteraction(() -> !stoppedRestored.hasActiveTask() && stoppedRestored.getVisualState() == AgentController.VisualState.STOPPED,
+                    10000, "Ending a restored waiting task did not stop it");
+            check(stoppedRestored.getPendingQuestion() == null, "Stopping restored waiting state retained the question");
+            String recoveredOutput = controllerOutput(stoppedRestored);
+            runOnMainSync(stoppedRestored::resetToIdle);
+            waitForIdleSync();
+            check(stoppedRestored.getVisualState() == AgentController.VisualState.IDLE
+                            && recoveredOutput.equals(controllerOutput(stoppedRestored)),
+                    "Reset after a restored waiting task lost output or failed to reach IDLE");
+            log("Persisted WAITING_USER reconstructed without a process/request; Stop and Reset retained its record");
+
+            ControllerProbe pausedProbe = new ControllerProbe();
+            startInteraction(controller, pausedProbe, "PROBE_INTERRUPT");
+            awaitInteraction(() -> {
+                try { return interactionFixtureStatus().optBoolean("slow_started"); }
+                catch (Exception failure) { return false; }
+            }, 120000, "The deterministic slow request did not start");
+            Process pausedProcess = interactionProcess(controller);
+            String pausedConversationId = controller.getActiveConversationId();
+            String pausedSession = controller.getConversation(pausedConversationId).getString("session_id");
+            PhoneActionGate gate = (PhoneActionGate) accessibleField(AgentController.class, "actionGate").get(controller);
+            long oldTicket = gate.capture();
+            check(gate.isAllowed(oldTicket), "Active task gate was unexpectedly closed");
+            CountDownLatch openedAfterPause = new CountDownLatch(1);
+            runOnMainSync(() -> controller.pauseForUser(openedAfterPause::countDown));
+            check(!gate.isAllowed(oldTicket), "Pause did not close the action gate immediately");
+            check(openedAfterPause.await(15, TimeUnit.SECONDS), "Pause never reached its safe UI callback");
+            awaitInteraction(() -> controller.canAcceptInput() && controller.getVisualState() == AgentController.VisualState.PAUSED,
+                    15000, "Pause did not wait for native interrupt completion");
+            check(controller.hasActiveTask() && pausedProbe.finishedCallbacks.get() == 0,
+                    "Pause incorrectly completed the active task");
+            check(interactionProcess(controller) == pausedProcess && pausedProcess != null && pausedProcess.isAlive(),
+                    "Native pause destroyed the interactive process");
+            PhoneToolServer pausedBridge = (PhoneToolServer) accessibleField(AgentController.class, "bridge").get(controller);
+            int statesBeforeBlockedTool = pausedProbe.states.size();
+            Response blocked = request(pausedBridge, pausedBridge.token(), "read_screen");
+            check(!blocked.body.optBoolean("ok"), "Paused bridge allowed a phone operation");
+            waitForIdleSync();
+            check(pausedProbe.states.size() == statesBeforeBlockedTool, "Rejected phone operation changed presentation state");
+            runOnMainSync(() -> controller.continuePaused(pausedConversationId, "PROBE_AFTER_INTERRUPT",
+                    INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY));
+            check(!controller.canAcceptInput(), "Accepted continuation did not close input synchronously");
+            check(!gate.isAllowed(oldTicket), "Reopening the gate revived a pre-pause action ticket");
+            awaitInteractionResult(controller, pausedProbe, "PROBE_AFTER_INTERRUPT_OK");
+            check(pausedSession.equals(controller.getConversation(pausedConversationId).getString("session_id")),
+                    "Pause/correction started a different Claude session");
+            log("Pause closed the bridge, rejected old action generation, and continued the same native session after correction");
+
+            assertLiveQuestionStop(controller);
+            check(changedModelKeys.isEmpty(), "Interaction test changed user model configuration keys");
+            check(!new TaskHistoryStore(historyDirectory).getConversation(questionConversationId).toString().contains(INTERACTION_KEY),
+                    "Fixture credential leaked into stored conversation");
+            log("Stop cancelled a live pending question, reaped its process, and Reset preserved output; user model settings unchanged");
+        } finally {
+            AgentController finalRestored = restored;
+            AgentController finalStoppedRecovery = stoppedRecovery;
+            runOnMainSync(() -> {
+                controller.stop();
+                if (finalRestored != null) finalRestored.stop();
+                if (finalStoppedRecovery != null) finalStoppedRecovery.stop();
+                OverlayService.setPetState(userController.getVisualState());
+            });
+            runtime.cancel();
+            recoveryRuntime.cancel();
+            settings.unregisterOnSharedPreferenceChangeListener(observer);
+            shutdownTestController(controller);
+            if (restored != null) shutdownTestController(restored);
+            if (stoppedRecovery != null) shutdownTestController(stoppedRecovery);
+            deleteTestTree(directory);
+        }
+        check(!directory.exists(), "Disposable interaction runtime/history was not removed");
+    }
+
+    private static final String INTERACTION_URL = "http://127.0.0.1:18081";
+    private static final String INTERACTION_MODEL = "phoneagent-interaction-probe";
+    private static final String INTERACTION_KEY = "local-interaction-probe-only";
+
+    private void assertCancelledRuntimeRegistration(LinuxRuntime runtime) throws Exception {
+        Process child = new ProcessBuilder("/system/bin/sleep", "30").start();
+        Method register = LinuxRuntime.class.getDeclaredMethod("registerProcess", Process.class, long.class);
+        register.setAccessible(true);
+        AtomicLong epoch = (AtomicLong) accessibleField(LinuxRuntime.class, "cancellationEpoch").get(runtime);
+        boolean rejected = false;
+        try {
+            try { register.invoke(runtime, child, epoch.get() - 1); }
+            catch (InvocationTargetException expected) {
+                check(expected.getCause() instanceof IOException, "Cancelled runtime registration returned an unexpected failure");
+                rejected = true;
+            }
+            check(rejected && !child.isAlive(), "Cancelled runtime registration returned before its child was reaped");
+            log("Cancelled runtime startup reaped its exact child before rejecting registration");
+        } finally {
+            if (child.isAlive()) {
+                Method pid = AgentController.class.getDeclaredMethod("childPid", Process.class);
+                pid.setAccessible(true);
+                int identity = (Integer) pid.invoke(null, child);
+                if (identity > 0) android.os.Process.killProcess(identity);
+                check(child.waitFor(5, TimeUnit.SECONDS), "Could not clean isolated startup-cancellation child");
+            }
+        }
+    }
+
+    private void assertLiveQuestionStop(AgentController controller) throws Exception {
+        ControllerProbe probe = new ControllerProbe();
+        startInteraction(controller, probe, "PROBE_ASK");
+        awaitInteraction(() -> controller.getVisualState() == AgentController.VisualState.WAITING_USER
+                && controller.canAcceptInput(), 120000, "Native stop-test question did not wait");
+        Process child = interactionProcess(controller);
+        Method pidMethod = AgentController.class.getDeclaredMethod("childPid", Process.class);
+        pidMethod.setAccessible(true);
+        int childPid = child == null ? -1 : (Integer) pidMethod.invoke(null, child);
+        log("Before live question Stop: process=" + (child != null) + ", alive=" + (child != null && child.isAlive())
+                + ", running=" + controller.isRunning() + ", active=" + controller.hasActiveTask()
+                + ", class=" + (child == null ? "none" : child.getClass().getName()) + ", exact_child_pid=" + childPid);
+        check(childPid > 0, "The native child PID could not be resolved safely");
+        Map<String, String> originalNativeIdentities = logNativeProcessIdentities("before Stop", processTable());
+        long stopStarted = SystemClock.uptimeMillis();
+        runOnMainSync(controller::stop);
+        check(probe.finished.await(15, TimeUnit.SECONDS), "Stop during live question did not finish");
+        awaitInteraction(() -> !controller.isRunning() && !controller.hasActiveTask(), 5000,
+                "Live question retained active task state after Stop");
+        log("After live question Stop: state=" + controller.getVisualState() + ", cancelled="
+                + accessibleField(AgentController.class, "cancelled").getBoolean(controller) + ", finishing="
+                + accessibleField(AgentController.class, "finishing").getBoolean(controller) + ", success=" + probe.success.get()
+                + ", pending=" + (controller.getPendingQuestion() != null) + ", process=" + (interactionProcess(controller) != null)
+                + ", original_process_alive=" + (child != null && child.isAlive())
+                + ", stop_elapsed_ms=" + (SystemClock.uptimeMillis() - stopStarted) + ", message=" + probe.message.get());
+        check(controller.getVisualState() == AgentController.VisualState.STOPPED, "Live question Stop did not publish STOPPED");
+        check(!probe.success.get(), "Live question Stop published success");
+        check(controller.getPendingQuestion() == null, "Live question Stop retained its pending question");
+        check(interactionProcess(controller) == null, "Live question Stop retained its process reference");
+        check(child != null, "Stop test had already lost its live native process before Stop");
+        check(!child.isAlive(), "Live question Stop did not reap its original process");
+        String processes = processTable();
+        java.util.regex.Matcher leftovers = java.util.regex.Pattern.compile("(?m)^.*\\s(?:claude|(?:lib)?proot(?:\\.so)?)\\s*$").matcher(processes);
+        boolean nativeRemains = false;
+        boolean sawZombie = false;
+        while (leftovers.find()) {
+            String line = leftovers.group().trim(), pid = line.split("\\s+")[0];
+            String identity = nativeProcessIdentity(pid);
+            boolean zombie = identity.startsWith("state=Z") || identity.startsWith("state=X");
+            sawZombie |= zombie;
+            nativeRemains |= !zombie && new File("/proc/" + pid).exists();
+            log("Native process present before instrumentation cleanup: " + line + "; " + identity
+                    + "; same_starttime=" + (!processStarttime(identity).isEmpty()
+                    && processStarttime(identity).equals(processStarttime(originalNativeIdentities.get(pid)))));
+        }
+        check(!nativeRemains,
+                "An executable native Claude/PRoot process remains before instrumentation cleanup");
+        if (sawZombie) {
+            long reapDeadline = SystemClock.uptimeMillis() + 1000;
+            boolean listed;
+            do {
+                SystemClock.sleep(100);
+                listed = java.util.regex.Pattern.compile("(?m)^.*\\s(?:claude|(?:lib)?proot(?:\\.so)?)\\s*$")
+                        .matcher(processTable()).find();
+            } while (listed && SystemClock.uptimeMillis() < reapDeadline);
+            log("Non-executable native zombies after bounded kernel-reaping wait: " + listed);
+        }
+        log("Stopped native child is reaped and no executable Claude/PRoot process remains before instrumentation cleanup");
+        String output = controllerOutput(controller);
+        runOnMainSync(controller::resetToIdle);
+        waitForIdleSync();
+        check(controller.getVisualState() == AgentController.VisualState.IDLE && output.equals(controllerOutput(controller)),
+                "Live question Reset lost output");
+    }
+
+    private String processTable() throws Exception {
+        Process listing = new ProcessBuilder("/system/bin/ps", "-A", "-o", "PID,PPID,STAT,NAME").redirectErrorStream(true).start();
+        StringBuilder result = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(listing.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) result.append(line).append('\n');
+        }
+        check(listing.waitFor(5, TimeUnit.SECONDS) && listing.exitValue() == 0, "Could not check stopped native child processes");
+        return result.toString();
+    }
+
+    private Map<String, String> logNativeProcessIdentities(String stage, String table) {
+        Map<String, String> result = new HashMap<>();
+        java.util.regex.Matcher processes = java.util.regex.Pattern.compile("(?m)^.*\\s(?:claude|(?:lib)?proot(?:\\.so)?)\\s*$").matcher(table);
+        while (processes.find()) {
+            String line = processes.group().trim(), pid = line.split("\\s+")[0];
+            String identity = nativeProcessIdentity(pid);
+            result.put(pid, identity);
+            log("Native process " + stage + ": " + line + "; " + identity);
+        }
+        return result;
+    }
+
+    private String nativeProcessIdentity(String pid) {
+        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/" + pid + "/stat"))) {
+            String value = reader.readLine();
+            String[] fields = value.substring(value.lastIndexOf(')') + 2).split("\\s+");
+            return "state=" + fields[0] + ", ppid=" + fields[1] + ", starttime=" + fields[19];
+        } catch (Exception gone) { return "unavailable"; }
+    }
+
+    private String processStarttime(String value) {
+        if (value == null || !value.contains("starttime=")) return "";
+        return value.substring(value.indexOf("starttime=") + 10);
+    }
+
+    private void startInteraction(AgentController controller, ControllerProbe probe, String prompt) {
+        runOnMainSync(() -> {
+            controller.setListener(probe);
+            controller.run(prompt, INTERACTION_URL, INTERACTION_MODEL, INTERACTION_KEY);
+        });
+    }
+
+    private void awaitInteractionResult(AgentController controller, ControllerProbe probe, String expected) throws Exception {
+        check(probe.finished.await(120, TimeUnit.SECONDS), "Interaction task timed out: " + probe.status.get());
+        check(probe.success.get() && probe.output.get().contains(expected),
+                "Interaction fixture failed: " + probe.message.get() + "\n" + probe.output.get());
+        check(!controller.isRunning() && !controller.hasActiveTask()
+                && controller.getVisualState() == AgentController.VisualState.SUCCESS, "Completed interaction retained active state");
+    }
+
+    private Process interactionProcess(AgentController controller) throws Exception {
+        return (Process) accessibleField(AgentController.class, "process").get(controller);
+    }
+
+    private void awaitInteraction(BooleanSupplier ready, long timeout, String failure) {
+        long deadline = SystemClock.uptimeMillis() + timeout;
+        while (!ready.getAsBoolean() && SystemClock.uptimeMillis() < deadline) SystemClock.sleep(100);
+        check(ready.getAsBoolean(), failure);
+    }
+
+    private JSONObject interactionFixtureStatus() throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(INTERACTION_URL + "/status").openConnection();
+        connection.setConnectTimeout(2000); connection.setReadTimeout(2000);
+        try (InputStream input = connection.getInputStream(); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[512];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                check(output.size() + count < 4096, "Fixture status response exceeded its bound");
+                output.write(buffer, 0, count);
+            }
+            return new JSONObject(new String(output.toByteArray(), StandardCharsets.UTF_8));
+        } finally { connection.disconnect(); }
+    }
+
+    private byte[] readInteractionSession(File file) throws Exception {
+        try (InputStream input = new FileInputStream(file); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                check(output.size() + count <= 2 * 1024 * 1024, "Synthetic native session exceeded snapshot limit");
+                output.write(buffer, 0, count);
+            }
+            return output.toByteArray();
+        }
+    }
+
     /** Three real CLI invocations: A, B, then --resume A after rebuilding Controller. */
     private void resume() throws Exception {
         long serviceDeadline = SystemClock.uptimeMillis() + 15000;
@@ -1141,11 +1570,15 @@ public final class TestInstrumentation extends Instrumentation {
     }
 
     private void shutdownTestController(AgentController controller) throws Exception {
-        Field field = AgentController.class.getDeclaredField("worker");
-        field.setAccessible(true);
-        java.util.concurrent.ExecutorService worker = (java.util.concurrent.ExecutorService) field.get(controller);
-        worker.shutdown();
-        check(worker.awaitTermination(15, TimeUnit.SECONDS), "Isolated Controller worker did not finish during cleanup");
+        for (String name : new String[]{"worker", "controls"}) {
+            Field field;
+            try { field = AgentController.class.getDeclaredField(name); }
+            catch (NoSuchFieldException unavailable) { continue; }
+            field.setAccessible(true);
+            java.util.concurrent.ExecutorService executor = (java.util.concurrent.ExecutorService) field.get(controller);
+            executor.shutdown();
+            check(executor.awaitTermination(15, TimeUnit.SECONDS), "Isolated Controller " + name + " did not finish during cleanup");
+        }
     }
 
     /** Temporarily render isolated history through the real Activity; never send a UI prompt. */

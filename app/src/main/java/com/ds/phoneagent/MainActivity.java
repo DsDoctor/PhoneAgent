@@ -17,6 +17,8 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
@@ -24,9 +26,13 @@ import android.view.WindowManager;
 import android.view.WindowInsets;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -36,9 +42,11 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
 import java.nio.charset.StandardCharsets;
@@ -51,6 +59,7 @@ import javax.crypto.spec.GCMParameterSpec;
 
 /** Minimal, native UI. Runtime internals stay behind the task and setup controls. */
 public final class MainActivity extends Activity {
+    public static final String ACTION_EDIT_ACTIVE_TASK = "com.ds.phoneagent.EDIT_ACTIVE_TASK";
     private static final int BACKGROUND = Color.rgb(251, 246, 238);
     private static final int INK = Color.rgb(70, 51, 41);
     private static final int MUTED = Color.rgb(121, 99, 83);
@@ -68,15 +77,20 @@ public final class MainActivity extends Activity {
     private EditText prompt, baseUrl, model, apiKey;
     private Button send, stop, prepare, control, bubble, historyButton, newTaskButton, setupToggle;
     private SwipeDeleteRow revealedRow;
-    private LinearLayout modelFields, setupPanel, historyPanel, composer;
+    private LinearLayout modelFields, setupPanel, interactionPanel, historyPanel, composer;
     private String selectedConversationId = "";
     private boolean showHistory = false;
     private boolean editingConnection;
+    private boolean leavingForExecution;
+    private boolean focusActiveInput;
     private String renderedHistory = "";
+    private String renderedInteraction = "";
     private long historyRenderVersion;
     private int visibleTurnLimit = 10;
     private String unsavedOutput = "", unsavedConversationId = "";
     private final Map<String, String> drafts = new HashMap<>();
+    private final Map<String, String> questionTextDrafts = new HashMap<>();
+    private final Map<String, Set<String>> questionSelections = new HashMap<>();
     private final Set<String> expandedProcesses = new HashSet<>();
     private ScrollView contentScroll;
     private MonthlyCatView statePet;
@@ -114,6 +128,8 @@ public final class MainActivity extends Activity {
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         preferences = getSharedPreferences("phoneagent", MODE_PRIVATE);
         controller = AgentController.get(this);
+        // Close the action gate before an ordinary launcher entry exposes any controls.
+        if (controller.isRunning()) controller.pauseForUser();
         createUi();
         baseUrl.setText(preferences.getString("base_url", ""));
         model.setText(preferences.getString("model", ""));
@@ -126,6 +142,14 @@ public final class MainActivity extends Activity {
             Bundle savedDrafts = savedState.getBundle("drafts");
             if (savedDrafts != null) for (String key : savedDrafts.keySet())
                 drafts.put(key, savedDrafts.getString(key, ""));
+            Bundle questionTexts = savedState.getBundle("question_texts");
+            if (questionTexts != null) for (String key : questionTexts.keySet())
+                questionTextDrafts.put(key, questionTexts.getString(key, ""));
+            Bundle questionChoices = savedState.getBundle("question_choices");
+            if (questionChoices != null) for (String key : questionChoices.keySet()) {
+                ArrayList<String> values = questionChoices.getStringArrayList(key);
+                if (values != null) questionSelections.put(key, new LinkedHashSet<>(values));
+            }
         } else {
             selectedConversationId = controller.getActiveConversationId();
             showHistory = false;
@@ -134,20 +158,42 @@ public final class MainActivity extends Activity {
             selectedConversationId = "";
         setupPanel.setVisibility(!controller.isReady() || baseUrl.length() == 0 || model.length() == 0 ? View.VISIBLE : View.GONE);
         setupToggle.setText(setupPanel.getVisibility() == View.VISIBLE ? "连接与设置  ∧" : "连接与设置  ›");
+        if (getIntent() != null && ACTION_EDIT_ACTIVE_TASK.equals(getIntent().getAction())) {
+            openActiveTask(true);
+            getIntent().setAction(null);
+        }
         renderHistory(true);
         controller.setListener(listener);
     }
 
     @Override protected void onResume() {
         super.onResume();
+        controller.setTaskUiVisible(true);
+        if (!leavingForExecution && controller.isRunning()) {
+            controller.pauseForUser();
+            if (controller.hasActiveTask()) openActiveTask(false);
+        }
         OverlayService.setActivityVisible(true);
         OverlayService.start(this, "");
         refreshState();
+        focusActiveTaskInput();
     }
 
     @Override protected void onPause() {
         OverlayService.setActivityVisible(false);
+        controller.setTaskUiVisible(false);
+        leavingForExecution = false;
         super.onPause();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (controller.isRunning()) controller.pauseForUser();
+        if (intent != null && ACTION_EDIT_ACTIVE_TASK.equals(intent.getAction())) {
+            openActiveTask(true);
+            intent.setAction(null);
+        }
     }
 
     @Override protected void onSaveInstanceState(Bundle outState) {
@@ -155,6 +201,13 @@ public final class MainActivity extends Activity {
         Bundle savedDrafts = new Bundle();
         for (Map.Entry<String, String> entry : drafts.entrySet()) savedDrafts.putString(entry.getKey(), entry.getValue());
         outState.putBundle("drafts", savedDrafts);
+        Bundle questionTexts = new Bundle();
+        for (Map.Entry<String, String> entry : questionTextDrafts.entrySet()) questionTexts.putString(entry.getKey(), entry.getValue());
+        outState.putBundle("question_texts", questionTexts);
+        Bundle questionChoices = new Bundle();
+        for (Map.Entry<String, Set<String>> entry : questionSelections.entrySet())
+            questionChoices.putStringArrayList(entry.getKey(), new ArrayList<>(entry.getValue()));
+        outState.putBundle("question_choices", questionChoices);
         outState.putString("draft", prompt.getText().toString());
         outState.putString("conversation", selectedConversationId);
         outState.putBoolean("history", showHistory);
@@ -241,6 +294,8 @@ public final class MainActivity extends Activity {
             setupToggle.setText(opening ? "连接与设置  ∧" : "连接与设置  ›");
             if (opening) contentScroll.post(() -> contentScroll.smoothScrollTo(0, 0));
         });
+        interactionPanel = vertical();
+        content.addView(interactionPanel);
         historyPanel = vertical();
         content.addView(historyPanel);
 
@@ -368,19 +423,30 @@ public final class MainActivity extends Activity {
         for (EditText field : new EditText[]{baseUrl, model, apiKey})
             field.setOnFocusChangeListener((view, focused) -> page.post(page::requestLayout));
         send.setOnClickListener(view -> submit());
+        prompt.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence value, int start, int before, int count) { refreshState(); }
+            @Override public void afterTextChanged(Editable value) { }
+        });
         stop.setOnClickListener(view -> {
-            if (controller.isRunning()) controller.stop();
+            if (controller.hasActiveTask() || controller.isRunning()) controller.stop();
             else controller.resetToIdle();
             refreshState();
         });
     }
 
     private void submit() {
+        boolean active = controller.hasActiveTask();
+        if (active && !viewingActiveTask()) { openActiveTask(true); focusActiveTaskInput(); return; }
+        if (active && !controller.canAcceptInput()) { toast("正在等待手机操作暂停，请稍候。"); return; }
         String task = prompt.getText().toString().trim();
+        JSONObject pending = active ? controller.getPendingQuestion() : null;
+        JSONObject answers = pending == null ? null : collectQuestionAnswers(pending, task);
+        if (pending != null && answers == null) return;
         String endpoint = baseUrl.getText().toString().trim();
         String chosenModel = model.getText().toString().trim();
         String secret = apiKey.getText().toString().trim();
-        if (task.isEmpty()) { toast("先输入想让手机完成的任务"); return; }
+        if (!active && task.isEmpty()) { toast("先输入想让手机完成的任务"); return; }
         if (!controller.isReady()) { toast("请先准备环境"); return; }
         if (!PhoneAccessibilityService.isEnabled()) { toast("请先开启 PhoneAgent 手机控制"); return; }
         if (endpoint.isEmpty() || chosenModel.isEmpty() || secret.isEmpty()) {
@@ -399,7 +465,7 @@ public final class MainActivity extends Activity {
         } catch (Exception invalid) {
             toast("请填写 HTTPS 服务地址；仅本机服务允许 HTTP。"); return;
         }
-        if (!selectedConversationId.isEmpty() && !showHistory) {
+        if (!active && !selectedConversationId.isEmpty() && !showHistory) {
             JSONObject conversation = controller.getConversation(selectedConversationId);
             if (conversation == null || !conversation.optBoolean("can_continue")) {
                 toast(conversation == null ? "这段对话已不可用，请新建任务。"
@@ -410,21 +476,35 @@ public final class MainActivity extends Activity {
         saveSettings();
         hideKeyboard();
         String submittedDraft = draftKey();
-        controller.runInConversation(showHistory ? "" : selectedConversationId, task, endpoint, chosenModel, secret);
+        leavingForExecution = true;
+        if (pending != null) {
+            // For a single unanswered question the main input is also a complete free-form answer.
+            JSONArray questions = pending.optJSONObject("input") == null ? null : pending.optJSONObject("input").optJSONArray("questions");
+            String extra = questions != null && questions.length() == 1
+                    && task.equals(answers.optString(questions.optJSONObject(0).optString("question"))) ? "" : task;
+            controller.answerQuestion(selectedConversationId, pending.optString("id"), answers, extra, endpoint, chosenModel, secret);
+        } else if (active) {
+            controller.continuePaused(selectedConversationId, task, endpoint, chosenModel, secret);
+        } else {
+            controller.runInConversation(showHistory ? "" : selectedConversationId, task, endpoint, chosenModel, secret);
+        }
         refreshState();
-        if (controller.isRunning()) {
+        boolean accepted = active ? !controller.canAcceptInput() : controller.isRunning();
+        if (accepted) {
             drafts.remove(submittedDraft);
+            if (pending != null) clearQuestionDrafts(pending.optString("id"));
             selectedConversationId = controller.getActiveConversationId();
             showHistory = false;
             prompt.setText("");
             renderHistory(true);
             moveTaskToBack(true);
-        }
+        } else leavingForExecution = false;
     }
 
     private void refreshState() {
         if (controller == null || prepare == null) return;
         boolean running = controller.isRunning();
+        boolean active = controller.hasActiveTask();
         statePet.setState(controller.getVisualState());
         boolean ready = controller.isReady();
         boolean accessible = PhoneAccessibilityService.isEnabled();
@@ -438,23 +518,237 @@ public final class MainActivity extends Activity {
         connectionStatus.setContentDescription(ready && accessible && configured
                 ? "运行环境、手机控制与模型配置已就绪" : "手机控制或模型连接待配置");
         prepare.setText(ready ? "环境已就绪" : "准备环境");
-        prepare.setEnabled(!running && !ready);
+        prepare.setEnabled(!active && !running && !ready);
         control.setText(accessible ? "手机控制设置" : "开启手机控制");
         bubble.setText(!overlay ? "开启悬浮球权限" : preferences.getBoolean("bubble_enabled", true) ? "隐藏悬浮球" : "显示悬浮球");
         boolean continuing = !showHistory && !selectedConversationId.isEmpty();
         JSONObject selected = continuing ? controller.getConversation(selectedConversationId) : null;
         boolean canContinue = selected != null && selected.optBoolean("can_continue");
-        send.setText(continuing ? "继续对话" : "开始执行");
-        send.setContentDescription(continuing ? "继续对话" : "开始执行");
-        send.setEnabled(!editingConnection && !running && (!continuing || canContinue));
-        prompt.setHint(continuing ? "接下来，还想让我做什么？" : "想让月薪喵做什么？");
-        stop.setText(running ? "停止" : "重置");
-        stop.setContentDescription(running ? "停止任务" : "重置为待命");
-        stop.setEnabled(running || controller.canResetToIdle());
+        String action = continuing ? "继续对话" : "开始执行";
+        String hint = continuing ? "接下来，还想让我做什么？" : "想让月薪喵做什么？";
+        boolean canSend = !running && (!continuing || canContinue);
+        if (active) {
+            if (!viewingActiveTask()) {
+                action = "回到待处理任务";
+                canSend = true;
+            } else {
+                JSONObject pending = controller.getPendingQuestion();
+                action = pending != null ? "回答并继续" : prompt.getText().toString().trim().isEmpty() ? "继续执行" : "发送并继续";
+                hint = pending != null ? "补充说明，或直接输入回答" : "补充、纠正任务，或直接继续";
+                canSend = controller.canAcceptInput();
+                if (!canSend) {
+                    AgentController.VisualState phase = controller.getVisualState();
+                    action = phase == AgentController.VisualState.RESUMING ? "继续中…"
+                            : phase == AgentController.VisualState.STOPPING ? "结束中…"
+                            : phase == AgentController.VisualState.PAUSING ? "暂停中…" : "执行中…";
+                    hint = phase == AgentController.VisualState.PAUSING ? "等待当前操作暂停后即可输入" : "当前任务正在处理中";
+                }
+            }
+        }
+        send.setText(action);
+        send.setContentDescription(action);
+        send.setEnabled(!editingConnection && canSend);
+        prompt.setHint(hint);
+        stop.setText(active || running ? "结束任务" : "重置");
+        stop.setContentDescription(active || running ? "结束任务" : "重置为待命");
+        stop.setEnabled(active || running || controller.canResetToIdle());
         historyButton.setSelected(showHistory);
         styleButton(historyButton, showHistory);
         styleButton(newTaskButton, !showHistory);
         newTaskButton.setSelected(!showHistory && selectedConversationId.isEmpty());
+        renderInteractionCard();
+    }
+
+    private boolean viewingActiveTask() {
+        return !showHistory && !selectedConversationId.isEmpty()
+                && selectedConversationId.equals(controller.getActiveConversationId());
+    }
+
+    private void openActiveTask(boolean focusInput) {
+        String id = controller.getActiveConversationId();
+        if (id.isEmpty() || controller.getConversation(id) == null) return;
+        if (showHistory || !id.equals(selectedConversationId)) navigate(false, id);
+        else { renderHistory(false); refreshState(); }
+        setupPanel.setVisibility(View.GONE);
+        setupToggle.setText("连接与设置  ›");
+        contentScroll.scrollTo(0, 0);
+        focusActiveInput |= focusInput;
+    }
+
+    private void focusActiveTaskInput() {
+        if (!focusActiveInput) return;
+        focusActiveInput = false;
+        // Keep the choices visible on entry; the user can open the keyboard for a free answer.
+        if (controller.getPendingQuestion() != null) return;
+        prompt.post(() -> {
+            if (isFinishing() || isDestroyed() || leavingForExecution || !viewingActiveTask()) return;
+            prompt.requestFocus();
+            prompt.setSelection(prompt.length());
+            ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(prompt, InputMethodManager.SHOW_IMPLICIT);
+        });
+    }
+
+    /** Separate from the transcript so incoming process updates never replace a question being edited. */
+    private void renderInteractionCard() {
+        if (interactionPanel == null) return;
+        boolean active = controller.hasActiveTask();
+        boolean selected = active && viewingActiveTask();
+        JSONObject pending = selected ? controller.getPendingQuestion() : null;
+        AgentController.VisualState phase = controller.getVisualState();
+        boolean accepting = controller.canAcceptInput();
+        String fingerprint = active + ":" + selected + ":" + controller.getActiveConversationId() + ":" + phase
+                + ":" + accepting + ":" + (pending == null ? "" : pending.toString());
+        if (fingerprint.equals(renderedInteraction)) return;
+        boolean firstQuestion = pending != null && !renderedInteraction.contains(pending.toString());
+        renderedInteraction = fingerprint;
+        interactionPanel.removeAllViews();
+        if (!active) return;
+        LinearLayout card = card();
+        if (!selected) {
+            TextView title = text("还有一个任务待处理", 16, INK);
+            title.setTypeface(Typeface.DEFAULT_BOLD); card.addView(title);
+            TextView help = text("补充内容和问题回答需要回到当前任务提交。这里的草稿会保留。", 13, MUTED);
+            help.setPadding(0, dp(8), 0, dp(10)); card.addView(help);
+            Button back = button("回到待处理任务", false);
+            back.setOnClickListener(view -> { openActiveTask(true); focusActiveTaskInput(); });
+            card.addView(back, new LinearLayout.LayoutParams(-1, -2));
+        } else if (pending != null) {
+            TextView title = text("等你回答", 18, INK);
+            title.setTypeface(Typeface.DEFAULT_BOLD); card.addView(title);
+            TextView help = text("选择选项或填写自己的回答，再点下方“回答并继续”。", 13, MUTED);
+            help.setPadding(0, dp(7), 0, dp(4)); card.addView(help);
+            JSONObject input = pending.optJSONObject("input");
+            JSONArray questions = input == null ? null : input.optJSONArray("questions");
+            if (questions != null) for (int i = 0; i < questions.length(); i++) {
+                JSONObject question = questions.optJSONObject(i);
+                if (question != null) addQuestion(card, pending.optString("id"), question, i, accepting);
+            }
+        } else {
+            String title = phase == AgentController.VisualState.PAUSED ? "任务已暂停"
+                    : phase == AgentController.VisualState.RESUMING ? "正在继续任务"
+                    : phase == AgentController.VisualState.STOPPING ? "正在结束任务" : "正在暂停任务";
+            String message = accepting ? "在下方补充或纠正任务，点“发送并继续”。不需要修改时，可以直接继续执行。"
+                    : phase == AgentController.VisualState.RESUMING ? "正在准备继续执行。"
+                    : phase == AgentController.VisualState.STOPPING ? "正在结束当前任务，请稍候。" : "正在等待已发出的手机操作结束，随后就能补充任务。";
+            TextView heading = text(title, 18, INK);
+            heading.setTypeface(Typeface.DEFAULT_BOLD); card.addView(heading);
+            TextView help = text(message, 14, MUTED);
+            help.setPadding(0, dp(8), 0, 0); card.addView(help);
+        }
+        interactionPanel.addView(card, spaced());
+        if (firstQuestion) contentScroll.post(() -> {
+            if (viewingActiveTask() && controller.getPendingQuestion() != null) contentScroll.smoothScrollTo(0, 0);
+        });
+    }
+
+    private void addQuestion(LinearLayout card, String requestId, JSONObject question, int index, boolean accepting) {
+        String questionText = question.optString("question");
+        String key = questionKey(requestId, questionText);
+        Set<String> choices = questionSelections.get(key);
+        if (choices == null) { choices = new LinkedHashSet<>(); questionSelections.put(key, choices); }
+        final Set<String> selectedChoices = choices;
+        boolean multiple = question.optBoolean("multiSelect");
+        String header = question.optString("header");
+        TextView label = text((index + 1) + ". " + (header.isEmpty() ? "你的回答" : header)
+                + (multiple ? " · 可多选" : " · 单选"), 12, MUTED);
+        label.setPadding(0, dp(16), 0, dp(5)); card.addView(label);
+        TextView title = text(questionText, 16, INK);
+        title.setTypeface(Typeface.DEFAULT_BOLD); title.setTextIsSelectable(true);
+        title.setPadding(0, 0, 0, dp(7)); card.addView(title);
+        LinearLayout options;
+        if (multiple) options = vertical();
+        else { RadioGroup group = new RadioGroup(this); group.setOrientation(LinearLayout.VERTICAL); options = group; }
+        card.addView(options, new LinearLayout.LayoutParams(-1, -2));
+        JSONArray values = question.optJSONArray("options");
+        if (values != null) for (int i = 0; i < values.length(); i++) {
+            JSONObject option = values.optJSONObject(i);
+            if (option == null) continue;
+            String value = option.optString("label");
+            String description = option.optString("description");
+            CompoundButton choice = multiple ? new CheckBox(this) : new RadioButton(this);
+            choice.setId(View.generateViewId());
+            choice.setText(value + (description.isEmpty() ? "" : "\n" + description));
+            choice.setTextSize(14); choice.setTextColor(INK);
+            choice.setButtonTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                    new int[]{ACCENT, MUTED}));
+            choice.setPadding(dp(2), dp(10), dp(4), dp(10));
+            choice.setMinHeight(dp(48)); choice.setEnabled(accepting);
+            choice.setChecked(selectedChoices.contains(value));
+            options.addView(choice, new LinearLayout.LayoutParams(-1, -2));
+            choice.setOnCheckedChangeListener((button, checked) -> {
+                if (multiple) { if (checked) selectedChoices.add(value); else selectedChoices.remove(value); }
+                else if (checked) { selectedChoices.clear(); selectedChoices.add(value); }
+            });
+        }
+        Button clear = plainButton("清空选项");
+        clear.setTextSize(12); clear.setEnabled(accepting);
+        clear.setContentDescription("清空第 " + (index + 1) + " 个问题的选项");
+        clear.setOnClickListener(view -> {
+            if (options instanceof RadioGroup) ((RadioGroup) options).clearCheck();
+            else for (int i = 0; i < options.getChildCount(); i++)
+                ((CompoundButton) options.getChildAt(i)).setChecked(false);
+            selectedChoices.clear();
+        });
+        LinearLayout clearRow = horizontal(); clearRow.setGravity(Gravity.END);
+        clearRow.addView(clear, new LinearLayout.LayoutParams(-2, -2)); card.addView(clearRow);
+        EditText custom = new EditText(this);
+        custom.setTextSize(15); custom.setTextColor(INK); custom.setHintTextColor(MUTED);
+        custom.setHint("其他回答（可选）");
+        custom.setContentDescription(questionText + "，自由回答");
+        custom.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        custom.setMinHeight(dp(48)); custom.setMaxLines(4);
+        custom.setPadding(dp(11), dp(10), dp(11), dp(10));
+        custom.setBackground(shape(BACKGROUND, BORDER, 10));
+        custom.setText(questionTextDrafts.containsKey(key) ? questionTextDrafts.get(key) : "");
+        custom.setEnabled(accepting);
+        LinearLayout.LayoutParams inputSize = new LinearLayout.LayoutParams(-1, -2);
+        inputSize.topMargin = dp(6); card.addView(custom, inputSize);
+        custom.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence value, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence value, int start, int before, int count) {
+                if (value.length() == 0) questionTextDrafts.remove(key); else questionTextDrafts.put(key, value.toString());
+            }
+            @Override public void afterTextChanged(Editable value) { }
+        });
+    }
+
+    private String questionKey(String requestId, String question) { return requestId + "\n" + question; }
+
+    private JSONObject collectQuestionAnswers(JSONObject pending, String freeText) {
+        JSONObject input = pending.optJSONObject("input");
+        JSONArray questions = input == null ? null : input.optJSONArray("questions");
+        if (questions == null || questions.length() == 0) { toast("问题暂时无法显示，请结束任务后重试。"); return null; }
+        JSONObject answers = new JSONObject();
+        try {
+            for (int i = 0; i < questions.length(); i++) {
+                JSONObject question = questions.optJSONObject(i);
+                if (question == null || question.optString("question").isEmpty()) {
+                    toast("问题内容不完整，请结束任务后重试。"); return null;
+                }
+                String text = question.optString("question");
+                String key = questionKey(pending.optString("id"), text);
+                Set<String> selected = questionSelections.get(key);
+                ArrayList<String> parts = new ArrayList<>();
+                JSONArray options = question.optJSONArray("options");
+                if (selected != null && options != null) for (int j = 0; j < options.length(); j++) {
+                    JSONObject option = options.optJSONObject(j);
+                    if (option != null && selected.contains(option.optString("label"))) parts.add(option.optString("label"));
+                }
+                String custom = questionTextDrafts.containsKey(key) ? questionTextDrafts.get(key).trim() : "";
+                if (!custom.isEmpty()) parts.add(custom);
+                String answer = TextUtils.join(", ", parts);
+                if (answer.isEmpty() && questions.length() == 1) answer = freeText;
+                if (answer.isEmpty()) { toast("请先回答第 " + (i + 1) + " 个问题，可选择选项或自由输入。"); return null; }
+                answers.put(text, answer);
+            }
+        } catch (org.json.JSONException invalid) { toast("暂时无法整理回答，请重试。"); return null; }
+        return answers;
+    }
+
+    private void clearQuestionDrafts(String requestId) {
+        String prefix = requestId + "\n";
+        questionTextDrafts.keySet().removeIf(key -> key.startsWith(prefix));
+        questionSelections.keySet().removeIf(key -> key.startsWith(prefix));
     }
 
     @Override public void onBackPressed() {
@@ -506,7 +800,7 @@ public final class MainActivity extends Activity {
                 item.setContentDescription(entry.optString("title") + "，" + stateLabel(entry.optString("status")) + "，查看任务");
                 SwipeDeleteRow row = new SwipeDeleteRow(this, item, () -> openConversation(id), () -> deleteConversation(id));
                 row.setTag(id);
-                row.setDeleteEnabled(!(controller.isRunning() && id.equals(controller.getActiveConversationId())));
+                row.setDeleteEnabled(!(controller.hasActiveTask() && id.equals(controller.getActiveConversationId())));
                 row.setOnReveal(() -> {
                     if (revealedRow != null && revealedRow != row) revealedRow.close();
                     revealedRow = row;
@@ -541,14 +835,15 @@ public final class MainActivity extends Activity {
                 available.setTextIsSelectable(true); available.setPadding(0, dp(10), 0, 0);
                 fallback.addView(available); historyPanel.addView(fallback, spaced());
             }
-            if (!detail.optBoolean("can_continue") && !"running".equals(detail.optString("status"))) {
+            if (!detail.optBoolean("can_continue") && !(controller.hasActiveTask() && viewingActiveTask())
+                    && !"running".equals(detail.optString("status"))) {
                 TextView note = text(detail.optString("continue_unavailable_reason", "这段对话暂时无法继续，可以新建任务。"), 12, MUTED);
                 note.setPadding(0, dp(2), 0, dp(14)); historyPanel.addView(note);
             }
         }
         if (!force) contentScroll.post(() -> {
             if (rendering != historyRenderVersion || isFinishing() || isDestroyed()) return;
-            if (atEnd && !showHistory) contentScroll.fullScroll(View.FOCUS_DOWN);
+            if (atEnd && !showHistory && !(controller.hasActiveTask() && viewingActiveTask())) contentScroll.fullScroll(View.FOCUS_DOWN);
             else contentScroll.scrollTo(0, scrollY);
         });
     }
@@ -662,6 +957,10 @@ public final class MainActivity extends Activity {
             String pending;
             switch (turnState) {
                 case "running": pending = "月薪喵正在处理，最终结果会显示在这里。"; break;
+                case "pausing": pending = "正在暂停手机操作，任务尚未结束。"; break;
+                case "paused": pending = "任务已暂停，可以补充或纠正后继续。"; break;
+                case "waiting_user": pending = "月薪喵在等你回答，任务尚未结束。"; break;
+                case "resuming": pending = "正在继续任务，最终结果会显示在这里。"; break;
                 case "stopped": pending = "这轮已停止，尚未生成最终结果。"; break;
                 case "interrupted": pending = "这轮被中断，尚未收到最终结果。"; break;
                 case "success": pending = "任务已结束，但没有返回结果正文。"; break;
@@ -671,12 +970,22 @@ public final class MainActivity extends Activity {
             message.setLineSpacing(dp(3), 1);
             message.setPadding(dp(2), dp(2), dp(2), dp(6)); response.addView(message);
         }
+        String answer = turn.optString("interaction_answer");
+        if (!answer.isEmpty()) {
+            TextView reply = text("你的补充 / 回答\n" + answer, 14, INK);
+            reply.setTextIsSelectable(true); reply.setLineSpacing(dp(3), 1);
+            reply.setPadding(dp(10), dp(10), dp(10), dp(10));
+            reply.setBackground(shape(USER_BUBBLE, Color.TRANSPARENT, 12));
+            LinearLayout.LayoutParams replySize = new LinearLayout.LayoutParams(-1, -2);
+            replySize.topMargin = dp(12); response.addView(reply, replySize);
+        }
         String terminal = turn.optString("terminal");
         if (!terminal.isEmpty()) {
             TextView footer = text(terminal.replace("【任务结束】\n", ""), 12, MUTED);
             footer.setTextIsSelectable(true); footer.setLineSpacing(dp(2), 1);
             footer.setPadding(dp(2), dp(12), dp(2), dp(2)); response.addView(footer);
-        } else if ("running".equals(turnState)) {
+        } else if ("running".equals(turnState) || "pausing".equals(turnState) || "paused".equals(turnState)
+                || "waiting_user".equals(turnState) || "resuming".equals(turnState)) {
             TextView status = text(turn.optString("status", "任务进行中…"), 12, ACCENT);
             status.setPadding(dp(2), dp(10), dp(2), dp(2)); response.addView(status);
         }
@@ -712,7 +1021,8 @@ public final class MainActivity extends Activity {
     private int stateColor(String state) {
         if ("success".equals(state)) return SUCCESS;
         if ("error".equals(state) || "interrupted".equals(state)) return ERROR;
-        return "running".equals(state) ? ACCENT : MUTED;
+        return "running".equals(state) || "pausing".equals(state) || "paused".equals(state)
+                || "waiting_user".equals(state) || "resuming".equals(state) ? ACCENT : MUTED;
     }
     private int stateFill(String state) {
         if ("success".equals(state)) return Color.rgb(237, 239, 216);
@@ -732,6 +1042,10 @@ public final class MainActivity extends Activity {
     private String stateLabel(String value) {
         switch (value) {
             case "running": return "进行中";
+            case "pausing": return "暂停中";
+            case "paused": return "已暂停";
+            case "waiting_user": return "等你回答";
+            case "resuming": return "继续中";
             case "success": return "已完成";
             case "stopped": return "已停止";
             case "interrupted": return "已中断";

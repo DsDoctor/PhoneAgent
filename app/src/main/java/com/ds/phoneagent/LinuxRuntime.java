@@ -36,6 +36,24 @@ public final class LinuxRuntime {
         temp = new File(base, "tmp");
     }
 
+    /** Test-only: reuse installed assets, while every writable user directory lives in unique cache. */
+    LinuxRuntime(Context context, File installedRoot, File isolatedBase) {
+        this.context = context.getApplicationContext();
+        if (installedRoot == null || isolatedBase == null) throw new IllegalArgumentException("Missing isolated runtime paths");
+        try {
+            File cache = context.getCacheDir().getCanonicalFile();
+            base = isolatedBase.getCanonicalFile();
+            if (!base.getPath().startsWith(cache.getPath() + File.separator))
+                throw new IllegalArgumentException("Isolated runtime must be inside the app cache");
+            root = installedRoot.getCanonicalFile();
+            if (root.equals(base) || root.getPath().startsWith(base.getPath() + File.separator))
+                throw new IllegalArgumentException("Installed assets must be separate from the isolated runtime");
+        } catch (IOException invalid) { throw new IllegalArgumentException("Cannot resolve isolated runtime paths", invalid); }
+        home = new File(base, "home");
+        bridge = new File(base, "phoneagent");
+        temp = new File(base, "tmp");
+    }
+
     public boolean isInstalled() {
         try {
             return RUNTIME_VERSION.equals(read(new File(root, ".phoneagent-runtime")).trim())
@@ -113,10 +131,12 @@ public final class LinuxRuntime {
 
     /** Non-blocking cancellation; the worker performs process reaping and staging cleanup. */
     public void cancel() {
+        Process cancelledProcess;
         synchronized (processLock) {
             cancellationEpoch.incrementAndGet();
-            if (activeProcess != null && activeProcess.isAlive()) activeProcess.destroy();
+            cancelledProcess = activeProcess;
         }
+        if (cancelledProcess != null) cancelProcessAsync(cancelledProcess);
     }
 
     public Process startClaude(String prompt, String baseUrl, String model, String apiKey,
@@ -188,6 +208,48 @@ public final class LinuxRuntime {
         environment.put("PHONE_AGENT_PORT", Integer.toString(bridgePort));
         environment.put("PHONE_AGENT_TOKEN", bridgeToken);
         return start(args, environment, root, operation);
+    }
+
+    /** Native bidirectional SDK transport. The caller owns stdout and the task lifecycle. */
+    public ClaudeTransport startInteractiveClaude(String baseUrl, String model, String apiKey,
+                                                  int bridgePort, String bridgeToken, String sessionId) throws Exception {
+        final long operation = cancellationEpoch.get();
+        if (!isInstalled()) throw new IOException("请先准备运行环境");
+        if (apiKey == null || apiKey.trim().isEmpty()) throw new IOException("请先填写模型 API Key");
+        if (sessionId != null && !sessionId.isEmpty() && !hasClaudeSession(sessionId)) throw new MissingSessionException();
+        updateBridge();
+        updateDns();
+        List<String> args = new ArrayList<>(Arrays.asList(
+                "/usr/local/bin/claude", "-p", "--input-format", "stream-json",
+                "--output-format", "stream-json", "--verbose", "--replay-user-messages",
+                "--permission-prompt-tool", "stdio", "--permission-mode", "default",
+                "--tools", "Read,Write,Edit,Glob,Grep,AskUserQuestion",
+                "--allowedTools", "Read,Write,Edit,Glob,Grep,mcp__phone__*",
+                "--strict-mcp-config", "--mcp-config", "/opt/phoneagent/mcp.json",
+                "--append-system-prompt",
+                "你是用户手机上的简洁助手，请用中文交流。通过 phone MCP 工具操作手机；本机 Read/Write/Edit/Glob/Grep 用于文件与记忆，当前不提供 Bash。"
+                + "每次收到新指令或暂停后的补充，都先重新读取当前手机界面，再规划操作；不得直接重放旧坐标或暂停前未执行的步骤。"
+                + "先观察界面、执行动作、再核实实际结果，工具请求成功不等于用户目标完成。任务开始查看 list_routines；有合适的已验证流程可用 run_routine。"
+                + "打开应用优先 open_app_ready；blocked 或失败时依据实际原因调整，同一动作两次无进展时换方法或向用户说明。"
+                + "需要用户选择、补充信息或澄清目标时，使用原生 AskUserQuestion，让 App 展示问题并等待答案，不要猜测答案继续操作。"
+                + "遇到手机工具返回暂停、停止或旧执行已失效时，不得重试旧动作；等待用户补充后重新读屏。"
+                + "长期记忆沿用 Claude Code 原生 memory 目录与 MEMORY.md 索引；用户明确要求记住的偏好或可复用事实可写入原生记忆，报告实际写入结果。"
+                + "会话记录不等于长期记忆，不得声称保存了没有实际写入的内容。"
+                + "可复用手机流程只有真实重复执行并核对结果后才用 save_routine 与实际 routine_receipt 保存；不编造验证凭据。"
+                + "任务完成或确实无法继续时，明确说明完成和未完成的部分。"));
+        if (sessionId != null && !sessionId.isEmpty()) {
+            args.add("--resume"); args.add(sessionId.toLowerCase(Locale.US));
+        }
+        if (model != null && !model.trim().isEmpty()) {
+            args.add("--model"); args.add(model.trim());
+        }
+        Map<String, String> environment = new HashMap<>();
+        environment.put("ANTHROPIC_API_KEY", apiKey.trim());
+        if (baseUrl != null && !baseUrl.trim().isEmpty()) environment.put("ANTHROPIC_BASE_URL", baseUrl.trim());
+        environment.put("PHONE_AGENT_PORT", Integer.toString(bridgePort));
+        environment.put("PHONE_AGENT_TOKEN", bridgeToken);
+        // Keep HOME/cwd unchanged: Claude's own per-project memory and sessions remain native.
+        return new ClaudeTransport(start(args, environment, root, operation));
     }
 
     public String version() throws Exception {
@@ -297,17 +359,10 @@ public final class LinuxRuntime {
             reader.join(1000);
             return output.toString("UTF-8");
         } finally {
-            if (process.isAlive()) {
-                process.destroy();
-                try {
-                    if (!process.waitFor(1000, TimeUnit.MILLISECONDS)) {
-                        process.destroyForcibly();
-                        process.waitFor(1000, TimeUnit.MILLISECONDS);
-                    }
-                } catch (InterruptedException interrupted) {
-                    process.destroyForcibly();
-                    Thread.currentThread().interrupt();
-                }
+            try { ProcessLifecycle.terminate(process); }
+            catch (ProcessLifecycle.CleanupException pending) {
+                cancelProcessAsync(process);
+                throw new IOException("运行环境进程仍在清理，请稍后重试。", pending);
             }
             synchronized (processLock) {
                 if (activeProcess == process) activeProcess = null;
@@ -316,13 +371,44 @@ public final class LinuxRuntime {
     }
 
     private void registerProcess(Process process, long operation) throws IOException {
-        synchronized (processLock) {
-            if (cancellationEpoch.get() != operation) {
-                process.destroyForcibly();
-                throw new IOException("操作已停止");
-            }
-            activeProcess = process;
+        try { ProcessLifecycle.capture(process); }
+        catch (ProcessLifecycle.CleanupException unavailable) {
+            cancelProcessAsync(process);
+            throw new IOException("无法追踪执行进程，正在清理。", unavailable);
         }
+        boolean cancelled;
+        synchronized (processLock) {
+            cancelled = cancellationEpoch.get() != operation;
+            if (!cancelled) activeProcess = process;
+        }
+        if (cancelled) {
+            // start() runs on a worker. Do not let its caller report STOPPED while
+            // a child it never received is still being cleaned up.
+            terminateUntilDone(process);
+            throw new IOException("操作已停止");
+        }
+    }
+
+    private void cancelProcessAsync(Process process) {
+        Thread cleanup = new Thread(() -> {
+            terminateUntilDone(process);
+            synchronized (processLock) { if (activeProcess == process) activeProcess = null; }
+        }, "phone-runtime-cleanup");
+        cleanup.setDaemon(true);
+        cleanup.start();
+    }
+
+    private static void terminateUntilDone(Process process) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            for (;;) {
+                try { ProcessLifecycle.terminate(process); break; }
+                catch (ProcessLifecycle.CleanupException pending) {
+                    interrupted |= Thread.interrupted();
+                    try { Thread.sleep(1000); } catch (InterruptedException stopped) { interrupted = true; }
+                }
+            }
+        } finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 
     private void checkCancelled(long operation) throws IOException {

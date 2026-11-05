@@ -164,8 +164,8 @@ public final class MainActivity extends Activity {
         historyButton = button("任务记录", false);
         historyButton.setContentDescription("打开最近任务");
         newTaskButton = button("＋ 新任务", true);
-        navigation.addView(historyButton, weighted());
         navigation.addView(newTaskButton, weighted());
+        navigation.addView(historyButton, weighted());
         page.addView(navigation);
         historyButton.setOnClickListener(view -> openHistory());
         newTaskButton.setOnClickListener(view -> {

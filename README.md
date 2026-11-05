@@ -1,6 +1,6 @@
 # PhoneAgent
 
-运行在 Android 手机上的轻量 Agent 原型，属于 AIResearch（AI 研究所）子项目。通过悬浮宠物「月薪喵」进入，输入文字任务，由手机后台的 Claude Code 调用工具操作手机。当前版本为 **0.3.1**。
+运行在 Android 手机上的轻量 Agent 原型，属于 AIResearch（AI 研究所）子项目。通过悬浮宠物「月薪喵」进入，输入文字任务，由手机后台的 Claude Code 调用工具操作手机。当前版本为 **0.3.2**。
 
 本项目独立实现 Android App、工具桥接和运行时装配，没有复制 Buddy 的代码或界面。Linux 只提供后台运行环境，没有桌面或终端入口。
 
@@ -80,6 +80,8 @@ adb install --no-incremental -r build/PhoneAgent-debug.apk
 ## 验证
 
 0.3.1 将任务记录与连接设置入口固定在上方，新增左滑删除和删除后的持久化处理，见 [0.3.1 实机记录](docs/validation/2026-11-05-huawei-ctr-al00-v0.3.1.md)。
+
+0.3.2 将顶部导航调整为左侧“新任务”、右侧“任务记录”，见 [0.3.2 实机记录](docs/validation/2026-11-05-huawei-ctr-al00-v0.3.2.md)。
 
 0.3.0 新增近期任务、真实会话续聊和 Markdown 结果展示；语音输入暂未实现。存储与续聊说明见 [任务会话说明](docs/task-conversations.md)，测试结果见 [0.3.0 实机记录](docs/validation/2026-11-05-huawei-ctr-al00-v0.3.0.md)。
 

@@ -117,6 +117,80 @@ public final class AgentController {
         historyChanged(presentationEpoch.get());
         return id;
     }
+
+    /** Delete App history only; a running selected conversation and all CLI session files are retained. */
+    public synchronized boolean deleteConversation(String id) throws IOException {
+        JSONObject conversation = historyStore.getConversation(id);
+        if (conversation == null) return false;
+        if (running && id.equals(activeConversationId)) throw new IOException("这段对话正在运行，请先停止任务再删除。");
+
+        JSONObject previous = taskStore.read();
+        boolean clearedLast = false;
+        if (isLastTaskOf(previous, conversation)) clearedLast = taskStore.clearIfUnchanged(previous);
+        try {
+            if (!historyStore.deleteConversation(id)) {
+                if (clearedLast) taskStore.restoreIfEmpty(previous);
+                return false;
+            }
+        } catch (IOException failure) {
+            if (clearedLast) {
+                try { taskStore.restoreIfEmpty(previous); }
+                catch (IOException restoreFailure) { failure.addSuppressed(restoreFailure); }
+            }
+            throw failure;
+        }
+
+        boolean changePresentation = !running && (id.equals(activeConversationId) || clearedLast);
+        final long epoch;
+        if (changePresentation) {
+            epoch = presentationEpoch.incrementAndGet();
+            activeConversationId = historyStore.latestId();
+            JSONObject next = historyStore.getConversation(activeConversationId);
+            JSONArray turns = next == null ? null : next.optJSONArray("turns");
+            JSONObject turn = turns == null || turns.length() == 0 ? null : turns.optJSONObject(turns.length() - 1);
+            if (turn == null) {
+                lastOutput = "";
+                lastStatus = runtime.isInstalled() ? "已删除任务记录，可以开始新任务。" : "任务记录已删除，请先准备运行环境。";
+                visualState = runtime.isInstalled() ? VisualState.IDLE : VisualState.NEEDS_INPUT;
+            } else {
+                lastOutput = turn.optString("output");
+                lastStatus = turn.optString("status");
+                String state = turn.optString("state");
+                visualState = state.equals("success") ? VisualState.SUCCESS
+                        : state.equals("stopped") ? VisualState.STOPPED : VisualState.ERROR;
+            }
+        } else epoch = presentationEpoch.get();
+        main.post(() -> {
+            if (epoch != presentationEpoch.get()) return;
+            Listener l = listener;
+            if (changePresentation) {
+                publishVisualState(visualState);
+                if (epoch != presentationEpoch.get()) return;
+                if (l != null) {
+                    l.onStatus(lastStatus);
+                    if (epoch != presentationEpoch.get()) return;
+                    l.onOutput(lastOutput);
+                }
+            }
+            if (epoch == presentationEpoch.get() && l != null) l.onHistoryChanged();
+        });
+        return true;
+    }
+
+    private static boolean isLastTaskOf(JSONObject previous, JSONObject conversation) {
+        if (previous == null || conversation == null) return false;
+        String linkedId = previous.optString("conversation_id");
+        if (!linkedId.isEmpty()) return linkedId.equals(conversation.optString("id"));
+        // Migrated pre-conversation records have no id; match their unchanged original evidence.
+        JSONArray turns = conversation.optJSONArray("turns");
+        if (turns == null) return false;
+        for (int i = 0; i < turns.length(); i++) {
+            JSONObject turn = turns.optJSONObject(i);
+            if (turn != null && turn.optLong("started_at") == previous.optLong("started_at")
+                    && turn.optString("output").equals(previous.optString("output"))) return true;
+        }
+        return false;
+    }
     private void addAvailability(JSONObject conversation) {
         if (conversation == null) return;
         String session = conversation.optString("session_id");
@@ -148,12 +222,31 @@ public final class AgentController {
                 presentationEpoch.incrementAndGet();
                 boolean ready = runtime.isInstalled();
                 lastStatus = ready ? "已重置为待命，可以开始新任务。" : "运行环境尚未就绪，请先准备运行环境。";
-                if (!taskStore.acknowledge()) lastStatus += "（重置状态暂时无法保存）";
+                if (!acknowledgeCurrentPresentation()) lastStatus += "（重置状态暂时无法保存）";
                 publishVisualState(ready ? VisualState.IDLE : VisualState.NEEDS_INPUT);
                 Listener current = listener;
                 if (current != null) current.onStatus(lastStatus);
             }
         });
+    }
+
+    private boolean acknowledgeCurrentPresentation() {
+        JSONObject conversation = historyStore.getConversation(activeConversationId);
+        JSONArray turns = conversation == null ? null : conversation.optJSONArray("turns");
+        JSONObject turn = turns == null || turns.length() == 0 ? null : turns.optJSONObject(turns.length() - 1);
+        if (turn == null) return taskStore.acknowledge();
+        try {
+            JSONObject fallback = new JSONObject().put("version", 1).put("state", turn.optString("state"))
+                    .put("status", turn.optString("status")).put("output", turn.optString("output"))
+                    .put("reason", turn.optString("reason")).put("conversation_id", activeConversationId)
+                    .put("turn_id", turn.optString("id")).put("session_id", conversation.optString("session_id"));
+            for (String field : new String[]{"started_at", "updated_at", "ended_at"}) fallback.put(field, turn.optLong(field));
+            for (String field : new String[]{"exit_code", "num_turns"}) {
+                Integer value = LastTaskStore.optionalInt(turn, field);
+                if (value != null) fallback.put(field, value);
+            }
+            return taskStore.acknowledge(fallback);
+        } catch (Exception unavailable) { return false; }
     }
     private void publishVisualState(VisualState value) {
         visualState = value;

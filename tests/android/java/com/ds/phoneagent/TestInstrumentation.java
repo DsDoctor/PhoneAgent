@@ -23,6 +23,8 @@ import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.MotionEvent;
+import android.view.InputDevice;
 import android.widget.ScrollView;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
@@ -110,6 +112,8 @@ public final class TestInstrumentation extends Instrumentation {
             else if ("history".equals(mode)) history();
             else if ("resume".equals(mode)) resume();
             else if ("markdown".equals(mode)) markdown();
+            else if ("delete".equals(mode)) deleteHistory();
+            else if ("historyui".equals(mode)) historyUi();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -1246,6 +1250,488 @@ public final class TestInstrumentation extends Instrumentation {
         for (TextView view : collectViews(root, TextView.class)) result.append(view.getText()).append('\n');
         return result.toString();
     }
+
+    /** Delete only cache-backed fixture history; never delete a real user's conversation. */
+    private void deleteHistory() throws Exception {
+        File directory = new File(getTargetContext().getCacheDir(), "delete-smoke-" + UUID.randomUUID());
+        check(!directory.exists(), "Unique deletion test directory already exists");
+        AgentController userController = AgentController.get(getTargetContext());
+        check(!userController.isRunning(), "Do not test deletion during a user task");
+        long serviceWaitStarted = SystemClock.uptimeMillis();
+        long serviceDeadline = serviceWaitStarted + 15000;
+        log("Waiting for the runner to bind accessibility before delete lifecycle fixtures");
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Accessibility did not bind within 15 seconds before delete fixtures");
+        log("Accessibility bound before delete fixtures after " + (SystemClock.uptimeMillis() - serviceWaitStarted) + " ms");
+        List<String> changedKeys = new CopyOnWriteArrayList<>();
+        SharedPreferences settings = getTargetContext().getSharedPreferences("phoneagent", Context.MODE_PRIVATE);
+        SharedPreferences.OnSharedPreferenceChangeListener observer = (preferences, key) -> changedKeys.add(key == null ? "<clear>" : key);
+        settings.registerOnSharedPreferenceChangeListener(observer);
+        AgentController runningController = null;
+        ControllerProbe runningProbe = new ControllerProbe();
+        try {
+            long now = System.currentTimeMillis();
+            File offlineDirectory = new File(directory, "offline");
+            Context offlineContext = isolatedFilesContext(offlineDirectory);
+            TaskHistoryStore store = new TaskHistoryStore(offlineDirectory);
+            store.initialize(null);
+            JSONObject older = fixtureConversation("保留旧记录", now - 2000);
+            JSONObject latest = fixtureConversation("删除当前记录", now - 1000);
+            String olderId = store.importConversation(older), latestId = store.importConversation(latest);
+            String olderBefore = store.getConversation(olderId).toString();
+            String cliSession = UUID.randomUUID().toString();
+            store.bindSession(latestId, cliSession);
+            File fakeSession = new File(offlineDirectory, "linux/home/.claude/projects/-home-agent/" + cliSession + ".jsonl");
+            check(fakeSession.getParentFile().mkdirs(), "Could not make isolated CLI session fixture directory");
+            try (FileOutputStream output = new FileOutputStream(fakeSession)) {
+                output.write("{\"fixture\":\"preserve-cli-session\"}\n".getBytes(StandardCharsets.UTF_8));
+            }
+            long sessionLength = fakeSession.length();
+            writeFixtureLastTask(offlineDirectory, store.getConversation(latestId));
+            AgentController deleting = constructIsolatedController(offlineContext);
+            check(latestId.equals(deleting.getActiveConversationId()), "Latest fixture was not the active persisted conversation");
+            check(deleting.deleteConversation(latestId), "Delete API did not remove an existing current conversation");
+            runOnMainSync(() -> { });
+            check(deleting.getConversation(latestId) == null && deleting.getConversations().length() == 1,
+                    "Deleted current conversation remains in Controller history");
+            check(new LastTaskStore(offlineDirectory).read() == null, "Deleting the last-task conversation retained a resurrection source");
+            check(fakeSession.isFile() && fakeSession.length() == sessionLength, "History deletion altered the separate CLI session file");
+            TaskHistoryStore afterDelete = new TaskHistoryStore(offlineDirectory);
+            afterDelete.initialize(null);
+            check(olderBefore.equals(afterDelete.getConversation(olderId).toString()), "Deleting one conversation modified unrelated history");
+            AgentController rebuilt = constructIsolatedController(offlineContext);
+            check(rebuilt.getConversation(latestId) == null && rebuilt.getConversations().length() == 1
+                            && olderId.equals(rebuilt.getActiveConversationId()), "Deleted current conversation revived after Controller reconstruction");
+            String remainingOutput = controllerOutput(rebuilt);
+            runOnMainSync(rebuilt::resetToIdle);
+            runOnMainSync(() -> { });
+            JSONObject resetRecord = new LastTaskStore(offlineDirectory).read();
+            check(resetRecord != null && resetRecord.optBoolean("acknowledged")
+                            && olderId.equals(resetRecord.optString("conversation_id"))
+                            && remainingOutput.equals(resetRecord.optString("output")),
+                    "Reset after deletion did not acknowledge the remaining conversation without losing its output");
+            check(olderBefore.equals(new TaskHistoryStore(offlineDirectory).getConversation(olderId).toString()),
+                    "Reset after deletion changed the remaining historical conversation");
+            rebuilt = constructIsolatedController(offlineContext);
+            check((rebuilt.getVisualState() == AgentController.VisualState.IDLE
+                            || rebuilt.getVisualState() == AgentController.VisualState.NEEDS_INPUT)
+                            && remainingOutput.equals(controllerOutput(rebuilt)) && rebuilt.getConversation(latestId) == null,
+                    "Reset after deletion did not survive Controller reconstruction, or revived the deleted record");
+            log("Reset after deleting latest record acknowledges only the remaining conversation and stays idle/setup after reconstruction");
+            check(!rebuilt.deleteConversation(latestId), "Deleting an absent ID did not return false");
+            check(rebuilt.deleteConversation(olderId), "Could not delete the last remaining history record");
+            runOnMainSync(() -> { });
+            AgentController empty = constructIsolatedController(offlineContext);
+            check(empty.getConversations().length() == 0 && empty.getActiveConversationId().isEmpty()
+                            && controllerOutput(empty).isEmpty(), "Deleting all records revived history or retained an old task presentation");
+            check(empty.getVisualState() == AgentController.VisualState.IDLE
+                            || empty.getVisualState() == AgentController.VisualState.NEEDS_INPUT, "Empty deleted history did not restore idle/setup state");
+            check(fakeSession.isFile() && fakeSession.length() == sessionLength, "Deleting all app history also removed CLI session evidence");
+            log("Current/last-task deletion persists, unrelated record stays byte-equivalent, empty history does not revive, CLI file stays intact");
+
+            File legacyDirectory = new File(directory, "legacy");
+            JSONObject legacyTask = syntheticTurn("success", "", "旧记录过程", "旧记录结果", now - 1000).put("version", 1);
+            new LastTaskStore(legacyDirectory).write(legacyTask);
+            AgentController legacyController = constructIsolatedController(isolatedFilesContext(legacyDirectory));
+            JSONArray legacyHistory = legacyController.getConversations();
+            check(legacyHistory.length() == 1 && legacyHistory.getJSONObject(0).optBoolean("legacy"), "Legacy fixture did not migrate");
+            check(legacyController.deleteConversation(legacyHistory.getJSONObject(0).getString("id")), "Could not delete migrated legacy conversation");
+            runOnMainSync(() -> { });
+            AgentController legacyRebuilt = constructIsolatedController(isolatedFilesContext(legacyDirectory));
+            check(legacyRebuilt.getConversations().length() == 0 && new LastTaskStore(legacyDirectory).read() == null,
+                    "Deleted migrated legacy record revived from last-task.json");
+            // Even an old supplied snapshot cannot remigrate after an explicit empty history was saved.
+            TaskHistoryStore legacyStore = new TaskHistoryStore(legacyDirectory);
+            legacyStore.initialize(legacyTask);
+            check(legacyStore.summaries().length() == 0, "Deleted empty history forgot its one-time migration marker");
+            log("Deleted legacy migration remains deleted even when an old last-task snapshot is supplied again");
+
+            check(PhoneAccessibilityService.isEnabled(), "Accessibility disconnected after the deletion persistence fixtures");
+            LinuxRuntime runtime = new LinuxRuntime(getTargetContext());
+            check(runtime.isInstalled(), "Run mode=runtime before mode=delete");
+            File runningDirectory = new File(directory, "running");
+            TaskHistoryStore runningStore = new TaskHistoryStore(runningDirectory);
+            runningStore.initialize(null);
+            String removable = runningStore.importConversation(fixtureConversation("运行时可删除的旧记录", now - 2000));
+            runningController = new AgentController(isolatedFilesContext(runningDirectory), runtime);
+            AgentController active = runningController;
+            runOnMainSync(() -> {
+                active.setListener(runningProbe);
+                active.run("仅用于删除生命周期测试，等待本地不可达服务。", "http://127.0.0.1:9", "phoneagent-smoke-model", "local-test-only");
+            });
+            Field processField = accessibleField(AgentController.class, "process");
+            long launchDeadline = SystemClock.uptimeMillis() + 5000;
+            Process process = null;
+            while (active.isRunning() && SystemClock.uptimeMillis() < launchDeadline) {
+                process = (Process) processField.get(active);
+                if (process != null && process.isAlive()) break;
+                SystemClock.sleep(50);
+            }
+            check(active.isRunning() && process != null && process.isAlive(), "No real CLI process for running deletion protection");
+            String activeId = active.getActiveConversationId();
+            long epoch = ((AtomicLong) accessibleField(AgentController.class, "presentationEpoch").get(active)).get();
+            boolean rejected = false;
+            try { active.deleteConversation(activeId); }
+            catch (IOException expected) { rejected = true; }
+            check(rejected && active.getConversation(activeId) != null, "Deletion did not reject the currently running conversation");
+            check(active.deleteConversation(removable), "Deleting unrelated old history was blocked by a running task");
+            runOnMainSync(() -> { });
+            check(active.isRunning() && activeId.equals(active.getActiveConversationId())
+                            && processField.get(active) == process && process.isAlive()
+                            && ((AtomicLong) accessibleField(AgentController.class, "presentationEpoch").get(active)).get() == epoch,
+                    "Deleting unrelated history disturbed the running task/process/epoch");
+            check(active.getConversation(removable) == null && runningProbe.finishedCallbacks.get() == 0,
+                    "Deleting old history left it present or fabricated task completion");
+            JSONObject activeTask = new LastTaskStore(runningDirectory).read();
+            check(activeTask != null && activeId.equals(activeTask.optString("conversation_id")) && "running".equals(activeTask.optString("state")),
+                    "Deleting old history cleared or changed the active last-task record");
+            runOnMainSync(active::stop);
+            check(runningProbe.finished.await(15, TimeUnit.SECONDS) && !active.isRunning(), "Running-delete fixture did not stop cleanly");
+            check(!runningProbe.success.get(), "Unreachable-loopback deletion fixture unexpectedly succeeded");
+            TaskHistoryStore runningRebuilt = new TaskHistoryStore(runningDirectory);
+            runningRebuilt.initialize(null);
+            check(runningRebuilt.getConversation(removable) == null && runningRebuilt.getConversation(activeId) != null,
+                    "Old-history deletion did not persist alongside the stopped current task");
+            check(changedKeys.isEmpty(), "Deletion touched user preference keys: " + changedKeys);
+            log("Running conversation rejects deletion; deleting older history preserves process, active identity, epoch and current record");
+        } finally {
+            AgentController active = runningController;
+            runOnMainSync(() -> {
+                if (active != null) { active.stop(); active.removeListener(runningProbe); }
+                OverlayService.setPetState(userController.getVisualState());
+            });
+            settings.unregisterOnSharedPreferenceChangeListener(observer);
+            if (runningController != null) shutdownTestController(runningController);
+            deleteTestTree(directory);
+        }
+    }
+
+    private JSONObject fixtureConversation(String title, long time) throws Exception {
+        return new JSONObject().put("id", UUID.randomUUID().toString()).put("title", title)
+                .put("created_at", time).put("updated_at", time).put("session_id", "")
+                .put("turns", new JSONArray().put(syntheticTurn("success", title, "本地过程 " + title, "# 本地结果\n\n" + title, time)));
+    }
+
+    private void writeFixtureLastTask(File directory, JSONObject conversation) throws Exception {
+        JSONArray turns = conversation.getJSONArray("turns");
+        JSONObject last = turns.getJSONObject(turns.length() - 1);
+        new LastTaskStore(directory).write(new JSONObject(last.toString()).put("version", 1)
+                .put("conversation_id", conversation.getString("id")).put("turn_id", last.getString("id"))
+                .put("session_id", conversation.optString("session_id")));
+    }
+
+    /** Real Activity navigation and touchscreen swipe-to-reveal, backed only by isolated fixtures. */
+    private void historyUi() throws Exception {
+        File directory = new File(getTargetContext().getCacheDir(), "history-ui-smoke-" + UUID.randomUUID());
+        check(!directory.exists(), "Unique history UI test directory already exists");
+        check(!AgentController.get(getTargetContext()).isRunning(), "Do not test history UI during a user task");
+        TaskHistoryStore store = new TaskHistoryStore(directory);
+        store.initialize(null);
+        long now = System.currentTimeMillis();
+        List<String> identities = new ArrayList<>();
+        for (int i = 0; i < 5; i++) identities.add(store.importConversation(fixtureConversation("滑动删除测试 " + i, now - i * 1000L)));
+        writeFixtureLastTask(directory, store.getConversation(identities.get(0)));
+        AgentController isolated = new AgentController(isolatedFilesContext(directory), new LinuxRuntime(getTargetContext()));
+        AtomicReference<HistoryUiSnapshot> saved = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try {
+            runOnMainSync(() -> {
+                try {
+                    HistoryUiSnapshot snapshot = new HistoryUiSnapshot(resumedMain);
+                    saved.set(snapshot);
+                    check(!snapshot.historyField.getBoolean(new MainActivity()), "Fresh Activity unexpectedly defaults to the recent-task list");
+                    snapshot.controllerField.set(resumedMain, isolated);
+                    snapshot.drafts.clear(); snapshot.expanded.clear();
+                    snapshot.selectedField.set(resumedMain, ""); snapshot.historyField.setBoolean(resumedMain, false);
+                    snapshot.prompt.setText("");
+                    snapshot.setupPanel.setVisibility(View.GONE); snapshot.setupToggle.setText("连接与设置  ›");
+                    snapshot.render.invoke(resumedMain, true); snapshot.refresh.invoke(resumedMain);
+                    check(renderedText(snapshot.historyPanel).contains("想让月薪喵做什么"), "Default new-task view is not distinct from the history list");
+                    check(!hasScrollAncestor(snapshot.historyButton) && !hasScrollAncestor(snapshot.setupToggle),
+                            "Task history or connection/settings entry is inside scrolling content");
+                    check("打开最近任务".contentEquals(snapshot.historyButton.getContentDescription())
+                                    && "连接与设置".contentEquals(snapshot.setupToggle.getContentDescription()),
+                            "Top navigation lacks explicit history/settings semantics");
+                    check(snapshot.setupToggle.performClick(), "Connection/settings entry did not respond");
+                    check(snapshot.setupPanel.getVisibility() == View.VISIBLE, "Connection/settings entry did not reveal settings");
+                    check(snapshot.historyButton.performClick(), "Task-record entry did not respond");
+                    check(snapshot.historyField.getBoolean(resumedMain) && snapshot.setupPanel.getVisibility() == View.GONE
+                                    && snapshot.historyButton.isSelected(), "Task-record entry did not clearly switch to recent list and close setup");
+                    check(collectViews(snapshot.historyPanel, SwipeDeleteRow.class).size() == 5,
+                            "Recent task list did not contain the five isolated fixtures");
+                } catch (Throwable error) { failure.set(error); }
+            });
+            rethrowUiFailure(failure);
+            waitForIdleSync();
+            HistoryUiSnapshot snapshot = saved.get();
+            Rect settingsBefore = globalBounds(snapshot.setupToggle);
+            Rect historyBefore = globalBounds(snapshot.historyButton);
+            runOnMainSync(() -> snapshot.scroll.scrollTo(0, snapshot.scroll.getChildAt(0).getHeight()));
+            waitForIdleSync();
+            check(settingsBefore.equals(globalBounds(snapshot.setupToggle)) && historyBefore.equals(globalBounds(snapshot.historyButton)),
+                    "Top history/settings entries moved when content scrolled");
+            runOnMainSync(() -> {
+                snapshot.historyButton.performClick();
+            });
+            positionHistoryRows(snapshot);
+            SwipeDeleteRow first = firstSwipeRow(snapshot.historyPanel);
+            StringBuffer touchEvidence = new StringBuffer();
+            runOnMainSync(() -> {
+                first.setOnTouchListener((view, event) -> { appendTouchEvidence(touchEvidence, "row", event); return false; });
+                first.getContentView().setOnTouchListener((view, event) -> { appendTouchEvidence(touchEvidence, "content", event); return false; });
+                first.getDeleteButton().setOnTouchListener((view, event) -> { appendTouchEvidence(touchEvidence, "delete", event); return false; });
+            });
+            Rect firstBounds = visibleBounds(first);
+            check(!first.isRevealed() && !first.getDeleteButton().isEnabled(), "Delete action was exposed before a horizontal swipe");
+            int beforeCount = isolated.getConversations().length();
+            touchGesture(firstBounds.left + firstBounds.width() * .7f, firstBounds.centerY(),
+                    firstBounds.left + firstBounds.width() * .68f, Math.min(firstBounds.bottom - 8, firstBounds.centerY() + firstBounds.height() * .35f));
+            waitForIdleSync();
+            check(!first.isRevealed() && isolated.getConversations().length() == beforeCount,
+                    "Predominantly vertical gesture revealed or deleted a conversation");
+            check(historyMode(snapshot), "Vertical list gesture opened a conversation");
+            logSwipeEvidence("after vertical", snapshot, first, touchEvidence);
+            positionHistoryRows(snapshot);
+            firstBounds = visibleBounds(first);
+            logSwipeEvidence("before left swipe", snapshot, first, touchEvidence);
+            touchGesture(firstBounds.left + firstBounds.width() * .82f, firstBounds.centerY(),
+                    firstBounds.left + firstBounds.width() * .18f, firstBounds.centerY());
+            waitForIdleSync();
+            logSwipeEvidence("after left swipe", snapshot, first, touchEvidence);
+            check(first.isRevealed() && first.getDeleteButton().isEnabled(), "Left swipe did not reveal the right-side Delete action");
+            check(historyMode(snapshot) && isolated.getConversations().length() == beforeCount,
+                    "Left swipe opened or deleted the conversation without a Delete tap");
+            Rect deleteBounds = visibleBounds(first.getDeleteButton());
+            check(deleteBounds.right >= firstBounds.right - 4 && deleteBounds.centerX() > firstBounds.centerX(),
+                    "Revealed Delete action is not on the right side of its row");
+            touchGesture(deleteBounds.centerX(), deleteBounds.top + deleteBounds.height() * .25f,
+                    deleteBounds.centerX(), deleteBounds.top + deleteBounds.height() * .75f);
+            waitForIdleSync();
+            check(historyMode(snapshot) && isolated.getConversations().length() == beforeCount
+                            && isolated.getConversation(identities.get(0)) != null,
+                    "Vertical movement starting on exposed Delete accidentally deleted or opened the conversation");
+            runOnMainSync(first::close);
+            positionHistoryRows(snapshot);
+            firstBounds = visibleBounds(first);
+            touchGesture(firstBounds.left + firstBounds.width() * .82f, firstBounds.centerY(),
+                    firstBounds.left + firstBounds.width() * .18f, firstBounds.centerY());
+            waitForIdleSync();
+            check(first.isRevealed(), "Could not re-reveal Delete after cancelling a vertical Delete-region gesture");
+            touchGesture(firstBounds.left + firstBounds.width() * .18f, firstBounds.centerY(),
+                    firstBounds.left + firstBounds.width() * .80f, firstBounds.centerY());
+            waitForIdleSync();
+            check(!first.isRevealed() && !first.getDeleteButton().isEnabled()
+                            && historyMode(snapshot) && isolated.getConversations().length() == beforeCount,
+                    "Right swipe did not close the Delete action without opening/deleting");
+            firstBounds = visibleBounds(first);
+            touchGesture(firstBounds.left + firstBounds.width() * .82f, firstBounds.centerY(),
+                    firstBounds.left + firstBounds.width() * .18f, firstBounds.centerY());
+            waitForIdleSync();
+            check(first.isRevealed() && isolated.getConversation(identities.get(0)) != null, "Reveal itself removed the fixture conversation");
+            deleteBounds = visibleBounds(first.getDeleteButton());
+            touchTap(deleteBounds.centerX(), deleteBounds.centerY());
+            waitForIdleSync();
+            check(isolated.getConversation(identities.get(0)) == null && isolated.getConversations().length() == beforeCount - 1,
+                    "Tapping the revealed Delete action did not delete exactly the chosen fixture");
+            check(historyMode(snapshot), "Deleting from recent list unexpectedly navigated into a conversation");
+            check(new LastTaskStore(directory).read() == null, "UI deletion left the fixture's associated last-task record");
+            TaskHistoryStore rebuilt = new TaskHistoryStore(directory);
+            rebuilt.initialize(null);
+            check(rebuilt.getConversation(identities.get(0)) == null && rebuilt.summaries().length() == 4,
+                    "UI-deleted fixture revived when history was reconstructed");
+            positionHistoryRows(snapshot);
+            SwipeDeleteRow remaining = firstSwipeRow(snapshot.historyPanel);
+            Rect remainingBounds = visibleBounds(remaining);
+            touchTap(remainingBounds.centerX(), remainingBounds.centerY());
+            waitForIdleSync();
+            check(!historyMode(snapshot), "Ordinary tap on a closed row did not open its conversation");
+            runOnMainSync(() -> snapshot.historyButton.performClick());
+            waitForIdleSync();
+            check(historyMode(snapshot) && collectViews(snapshot.historyPanel, SwipeDeleteRow.class).size() == 4,
+                    "Task-record entry did not return from detail to the updated recent list");
+            log("Real touch: vertical movement leaves list intact; left swipe only reveals right-side Delete; right swipe closes; only Delete tap removes fixture");
+            log("Fresh view, explicit task-record navigation, fixed top connection/settings, persistence and ordinary row tap verified");
+        } finally {
+            runOnMainSync(() -> {
+                try { if (saved.get() != null) saved.get().restore(); }
+                catch (Throwable error) { failure.set(error); }
+            });
+            deleteTestTree(directory);
+            rethrowUiFailure(failure);
+        }
+    }
+
+    private static boolean hasScrollAncestor(View view) {
+        android.view.ViewParent parent = view.getParent();
+        while (parent != null) {
+            if (parent instanceof ScrollView) return true;
+            parent = parent.getParent();
+        }
+        return false;
+    }
+
+    private boolean historyMode(HistoryUiSnapshot snapshot) throws Exception {
+        AtomicBoolean value = new AtomicBoolean();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        runOnMainSync(() -> { try { value.set(snapshot.historyField.getBoolean(resumedMain)); } catch (Throwable error) { failure.set(error); } });
+        rethrowUiFailure(failure);
+        return value.get();
+    }
+
+    private SwipeDeleteRow firstSwipeRow(View root) {
+        AtomicReference<SwipeDeleteRow> result = new AtomicReference<>();
+        runOnMainSync(() -> {
+            List<SwipeDeleteRow> rows = collectViews(root, SwipeDeleteRow.class);
+            check(!rows.isEmpty(), "No swipeable fixture rows were rendered");
+            result.set(rows.get(0));
+        });
+        return result.get();
+    }
+
+    private Rect globalBounds(View view) {
+        Rect result = new Rect();
+        runOnMainSync(() -> {
+            int[] location = new int[2]; view.getLocationOnScreen(location);
+            result.set(location[0], location[1], location[0] + view.getWidth(), location[1] + view.getHeight());
+        });
+        return result;
+    }
+
+    private Rect visibleBounds(View view) {
+        Rect result = new Rect();
+        AtomicBoolean visible = new AtomicBoolean();
+        runOnMainSync(() -> {
+            visible.set(view.getLocalVisibleRect(result));
+            int[] location = new int[2]; view.getLocationOnScreen(location);
+            result.offset(location[0], location[1]);
+        });
+        check(visible.get() && result.width() > 20 && result.height() > 20, "Fixture touch target is not sufficiently visible");
+        return result;
+    }
+
+    /** Cancel any previous ScrollView fling before repositioning a fixture, without a timed sleep. */
+    private void positionHistoryRows(HistoryUiSnapshot snapshot) {
+        runOnMainSync(() -> {
+            long now = SystemClock.uptimeMillis();
+            float x = snapshot.scroll.getWidth() / 2f, y = snapshot.scroll.getHeight() / 2f;
+            MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0);
+            MotionEvent cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, x, y, 0);
+            try {
+                // ScrollView's own ACTION_DOWN aborts its OverScroller; CANCEL cannot click any row.
+                snapshot.scroll.onTouchEvent(down);
+                snapshot.scroll.onTouchEvent(cancel);
+            } finally { down.recycle(); cancel.recycle(); }
+            snapshot.scroll.scrollTo(0, snapshot.historyPanel.getTop());
+        });
+        waitForIdleSync();
+    }
+
+    private static void appendTouchEvidence(StringBuffer evidence, String surface, MotionEvent event) {
+        int action = event.getActionMasked();
+        // DOWN/UP/CANCEL prove hit routing; first MOVE proves the raw/local coordinate relation.
+        if (action == MotionEvent.ACTION_MOVE && evidence.indexOf(surface + ":MOVE") >= 0) return;
+        String name = action == MotionEvent.ACTION_DOWN ? "DOWN" : action == MotionEvent.ACTION_UP ? "UP"
+                : action == MotionEvent.ACTION_CANCEL ? "CANCEL" : action == MotionEvent.ACTION_MOVE ? "MOVE" : Integer.toString(action);
+        evidence.append(surface).append(':').append(name).append(" raw=")
+                .append(Math.round(event.getRawX())).append(',').append(Math.round(event.getRawY()))
+                .append(" local=").append(Math.round(event.getX())).append(',').append(Math.round(event.getY())).append("; ");
+    }
+
+    private void logSwipeEvidence(String stage, HistoryUiSnapshot snapshot, SwipeDeleteRow row, StringBuffer touches) {
+        AtomicReference<String> geometry = new AtomicReference<>();
+        runOnMainSync(() -> {
+            Rect local = new Rect(), global = new Rect(), viewport = new Rect();
+            row.getLocalVisibleRect(local); row.getGlobalVisibleRect(global); snapshot.scroll.getGlobalVisibleRect(viewport);
+            int[] screen = new int[2]; row.getLocationOnScreen(screen);
+            List<SwipeDeleteRow> current = collectViews(snapshot.historyPanel, SwipeDeleteRow.class);
+            geometry.set("attached=" + row.isAttachedToWindow() + ", currentFirst=" + (!current.isEmpty() && current.get(0) == row)
+                    + ", scrollY=" + snapshot.scroll.getScrollY() + ", screen=" + Arrays.toString(screen)
+                    + ", localVisible=" + local + ", globalVisible=" + global + ", viewport=" + viewport
+                    + ", translation=" + row.getContentView().getTranslationX() + ", revealed=" + row.isRevealed()
+                    + ", deleteEnabled=" + row.getDeleteButton().isEnabled());
+        });
+        log("Swipe evidence " + stage + ": " + geometry.get() + "; events=" + touches);
+        touches.setLength(0);
+    }
+
+    private void touchGesture(float startX, float startY, float endX, float endY) {
+        long down = SystemClock.uptimeMillis();
+        sendTouch(down, MotionEvent.ACTION_DOWN, startX, startY);
+        for (int i = 1; i <= 12; i++) {
+            SystemClock.sleep(16);
+            sendTouch(down, MotionEvent.ACTION_MOVE, startX + (endX - startX) * i / 12,
+                    startY + (endY - startY) * i / 12);
+        }
+        sendTouch(down, MotionEvent.ACTION_UP, endX, endY);
+    }
+
+    private void touchTap(float x, float y) {
+        long down = SystemClock.uptimeMillis();
+        sendTouch(down, MotionEvent.ACTION_DOWN, x, y);
+        SystemClock.sleep(45);
+        sendTouch(down, MotionEvent.ACTION_UP, x, y);
+    }
+
+    private void sendTouch(long down, int action, float x, float y) {
+        MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0);
+        event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        try { sendPointerSync(event); } finally { event.recycle(); }
+    }
+
+    private static void rethrowUiFailure(AtomicReference<Throwable> failure) {
+        if (failure.get() != null) throw new AssertionError("History UI fixture failed", failure.get());
+    }
+
+    private final class HistoryUiSnapshot {
+        final MainActivity activity;
+        final Field controllerField, selectedField, historyField;
+        final Method render, refresh;
+        final AgentController controller;
+        final String selection, draft, setupText, unsavedOutput, unsavedId;
+        final boolean showHistory;
+        final int setupVisibility, scrollY, turnLimit;
+        final EditText prompt;
+        final TextView historyButton, setupToggle;
+        final View historyPanel, setupPanel;
+        final ScrollView scroll;
+        final Map<String, String> drafts, savedDrafts;
+        final Set<String> expanded, savedExpanded;
+        @SuppressWarnings("unchecked") HistoryUiSnapshot(MainActivity value) throws Exception {
+            activity = value;
+            controllerField = accessibleField(MainActivity.class, "controller");
+            selectedField = accessibleField(MainActivity.class, "selectedConversationId");
+            historyField = accessibleField(MainActivity.class, "showHistory");
+            controller = (AgentController) controllerField.get(activity);
+            selection = (String) selectedField.get(activity); showHistory = historyField.getBoolean(activity);
+            prompt = (EditText) accessibleField(MainActivity.class, "prompt").get(activity); draft = prompt.getText().toString();
+            historyButton = (TextView) accessibleField(MainActivity.class, "historyButton").get(activity);
+            setupToggle = (TextView) accessibleField(MainActivity.class, "setupToggle").get(activity); setupText = setupToggle.getText().toString();
+            historyPanel = (View) accessibleField(MainActivity.class, "historyPanel").get(activity);
+            setupPanel = (View) accessibleField(MainActivity.class, "setupPanel").get(activity); setupVisibility = setupPanel.getVisibility();
+            scroll = (ScrollView) accessibleField(MainActivity.class, "contentScroll").get(activity); scrollY = scroll.getScrollY();
+            drafts = (Map<String, String>) accessibleField(MainActivity.class, "drafts").get(activity); savedDrafts = new HashMap<>(drafts);
+            expanded = (Set<String>) accessibleField(MainActivity.class, "expandedProcesses").get(activity); savedExpanded = new HashSet<>(expanded);
+            turnLimit = accessibleField(MainActivity.class, "visibleTurnLimit").getInt(activity);
+            unsavedOutput = (String) accessibleField(MainActivity.class, "unsavedOutput").get(activity);
+            unsavedId = (String) accessibleField(MainActivity.class, "unsavedConversationId").get(activity);
+            render = MainActivity.class.getDeclaredMethod("renderHistory", boolean.class); render.setAccessible(true);
+            refresh = MainActivity.class.getDeclaredMethod("refreshState"); refresh.setAccessible(true);
+        }
+        void restore() throws Exception {
+            controllerField.set(activity, controller); selectedField.set(activity, selection); historyField.setBoolean(activity, showHistory);
+            drafts.clear(); drafts.putAll(savedDrafts); expanded.clear(); expanded.addAll(savedExpanded);
+            accessibleField(MainActivity.class, "visibleTurnLimit").setInt(activity, turnLimit);
+            accessibleField(MainActivity.class, "unsavedOutput").set(activity, unsavedOutput);
+            accessibleField(MainActivity.class, "unsavedConversationId").set(activity, unsavedId);
+            render.invoke(activity, true); refresh.invoke(activity);
+            prompt.setText(draft); setupPanel.setVisibility(setupVisibility); setupToggle.setText(setupText);
+            scroll.scrollTo(0, scrollY);
+            OverlayService.setPetState(controller.getVisualState());
+        }
+    }
+
+    /** Native Markdown presentation and inert unsafe destinations; no link is clicked. */
 
     /** Native Markdown presentation and inert unsafe destinations; no link is clicked. */
     private void markdown() throws Exception {

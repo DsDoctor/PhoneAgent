@@ -189,6 +189,24 @@ final class TaskHistoryStore {
         } catch (Exception failure) { restore(before); throw io(failure); }
     }
 
+    /** Remove only the App's record. The underlying Claude session is deliberately untouched. */
+    synchronized boolean deleteConversation(String id) throws IOException {
+        if (find(id) == null) return false;
+        String before = document.toString();
+        try {
+            JSONArray retained = new JSONArray();
+            for (int i = 0; i < conversations().length(); i++) {
+                JSONObject conversation = conversations().getJSONObject(i);
+                if (!id.equals(conversation.optString("id"))) retained.put(conversation);
+            }
+            document.put("conversations", retained);
+            // Even an empty list is intentional after deletion, never a fresh legacy-migration target.
+            document.put("legacy_migrated", true);
+            persist();
+            return true;
+        } catch (Exception failure) { restore(before); throw io(failure); }
+    }
+
     private JSONObject find(String id) {
         if (id == null) return null;
         for (int i = 0; i < conversations().length(); i++) {

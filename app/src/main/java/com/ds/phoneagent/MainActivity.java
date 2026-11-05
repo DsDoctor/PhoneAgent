@@ -51,10 +51,11 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private TextView state, capabilities;
     private EditText prompt, baseUrl, model, apiKey;
-    private Button send, stop, prepare, control, bubble;
+    private Button send, stop, prepare, control, bubble, historyButton, newTaskButton, setupToggle;
+    private SwipeDeleteRow revealedRow;
     private LinearLayout modelFields, setupPanel, historyPanel;
     private String selectedConversationId = "";
-    private boolean showHistory = true;
+    private boolean showHistory = false;
     private String renderedHistory = "";
     private long historyRenderVersion;
     private int visibleTurnLimit = 10;
@@ -104,15 +105,18 @@ public final class MainActivity extends Activity {
         if (savedState != null) {
             prompt.setText(savedState.getString("draft", ""));
             selectedConversationId = savedState.getString("conversation", "");
-            showHistory = savedState.getBoolean("history", true);
+            showHistory = savedState.getBoolean("history", false);
             Bundle savedDrafts = savedState.getBundle("drafts");
             if (savedDrafts != null) for (String key : savedDrafts.keySet())
                 drafts.put(key, savedDrafts.getString(key, ""));
-        } else if (controller.isRunning()) {
+        } else {
             selectedConversationId = controller.getActiveConversationId();
             showHistory = false;
         }
+        if (!selectedConversationId.isEmpty() && controller.getConversation(selectedConversationId) == null)
+            selectedConversationId = "";
         setupPanel.setVisibility(!controller.isReady() || baseUrl.length() == 0 || model.length() == 0 ? View.VISIBLE : View.GONE);
+        setupToggle.setText(setupPanel.getVisibility() == View.VISIBLE ? "连接与设置  ∧" : "连接与设置  ›");
         renderHistory(true);
         controller.setListener(listener);
     }
@@ -156,37 +160,43 @@ public final class MainActivity extends Activity {
         subtitle.setPadding(0, dp(4), 0, dp(16));
         page.addView(subtitle);
 
+        LinearLayout navigation = horizontal();
+        historyButton = button("任务记录", false);
+        historyButton.setContentDescription("打开最近任务");
+        newTaskButton = button("＋ 新任务", true);
+        navigation.addView(historyButton, weighted());
+        navigation.addView(newTaskButton, weighted());
+        page.addView(navigation);
+        historyButton.setOnClickListener(view -> openHistory());
+        newTaskButton.setOnClickListener(view -> {
+            hideKeyboard(); navigate(false, "");
+            contentScroll.scrollTo(0, 0);
+        });
+
+        setupToggle = button("连接与设置  ›", false);
+        setupToggle.setContentDescription("连接与设置");
+        LinearLayout.LayoutParams setupToggleSize = new LinearLayout.LayoutParams(-1, dp(40));
+        setupToggleSize.topMargin = dp(5); setupToggleSize.bottomMargin = dp(8);
+        page.addView(setupToggle, setupToggleSize);
+
         contentScroll = new ScrollView(this);
         contentScroll.setFillViewport(false);
         contentScroll.setClipToPadding(false);
         page.addView(contentScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout content = vertical();
         contentScroll.addView(content);
-
-        LinearLayout navigation = horizontal();
-        Button history = button("任务记录", false);
-        Button fresh = button("＋ 新任务", true);
-        navigation.addView(history, weighted());
-        navigation.addView(fresh, weighted());
-        content.addView(navigation, spaced());
-        history.setOnClickListener(view -> {
-            hideKeyboard(); navigate(true, "");
-            contentScroll.smoothScrollTo(0, 0);
-        });
-        fresh.setOnClickListener(view -> {
-            navigate(false, "");
-            contentScroll.smoothScrollTo(0, 0);
+        setupPanel = vertical();
+        content.addView(setupPanel);
+        setupToggle.setOnClickListener(view -> {
+            hideKeyboard();
+            boolean opening = setupPanel.getVisibility() != View.VISIBLE;
+            setupPanel.setVisibility(opening ? View.VISIBLE : View.GONE);
+            setupToggle.setText(opening ? "连接与设置  ∧" : "连接与设置  ›");
+            if (opening) contentScroll.post(() -> contentScroll.smoothScrollTo(0, 0));
         });
 
         historyPanel = vertical();
         content.addView(historyPanel);
-        Button setupToggle = button("设置与连接  ›", false);
-        content.addView(setupToggle, spaced());
-        setupPanel = vertical();
-        content.addView(setupPanel);
-        setupToggle.setOnClickListener(view -> setupPanel.setVisibility(
-                setupPanel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
-
         LinearLayout setup = card();
         LinearLayout statusRow = horizontal();
         statusRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -359,6 +369,10 @@ public final class MainActivity extends Activity {
         prompt.setHint(continuing ? "继续追问，或让月薪喵接着操作…" : "例如：打开大麦，看看北京的演唱会");
         stop.setText(running ? "停止" : "重置");
         stop.setEnabled(running || controller.canResetToIdle());
+        historyButton.setSelected(showHistory);
+        historyButton.setTextColor(showHistory ? Color.WHITE : GREEN);
+        historyButton.setBackground(shape(showHistory ? GREEN : Color.rgb(235, 244, 239), Color.TRANSPARENT, 11));
+        newTaskButton.setSelected(!showHistory && selectedConversationId.isEmpty());
     }
 
     @Override public void onBackPressed() {
@@ -381,12 +395,13 @@ public final class MainActivity extends Activity {
         long rendering = ++historyRenderVersion;
         int scrollY = contentScroll.getScrollY();
         boolean atEnd = contentScroll.getChildAt(0).getHeight() - contentScroll.getHeight() - scrollY < dp(80);
+        if (revealedRow != null) { revealedRow.close(); revealedRow = null; }
         historyPanel.removeAllViews();
         if (showHistory) {
-            TextView label = text("最近任务 · 保留 20 个会话", 13, MUTED);
+            TextView label = text("最近任务 · 左滑可删除", 13, MUTED);
             label.setPadding(0, dp(2), 0, dp(12)); historyPanel.addView(label);
             if (conversations.length() == 0) {
-                LinearLayout empty = card(); empty.addView(text(welcome(), 16, INK));
+                LinearLayout empty = card(); empty.addView(text("暂无任务记录，点“新任务”开始。", 16, INK));
                 historyPanel.addView(empty, spaced());
             }
             for (int i = 0; i < conversations.length(); i++) {
@@ -405,9 +420,14 @@ public final class MainActivity extends Activity {
                 }
                 TextView open = text("查看结果与过程  ›", 13, GREEN); open.setPadding(0, dp(9), 0, 0); item.addView(open);
                 item.setContentDescription(entry.optString("title") + "，" + stateLabel(entry.optString("status")) + "，查看任务");
-                item.setClickable(true); item.setFocusable(true);
-                item.setOnClickListener(view -> openConversation(id));
-                historyPanel.addView(item, spaced());
+                SwipeDeleteRow row = new SwipeDeleteRow(this, item, () -> openConversation(id), () -> deleteConversation(id));
+                row.setTag(id);
+                row.setDeleteEnabled(!(controller.isRunning() && id.equals(controller.getActiveConversationId())));
+                row.setOnReveal(() -> {
+                    if (revealedRow != null && revealedRow != row) revealedRow.close();
+                    revealedRow = row;
+                });
+                historyPanel.addView(row, spaced());
             }
         } else if (detail == null) {
             LinearLayout empty = card();
@@ -450,6 +470,30 @@ public final class MainActivity extends Activity {
             if (atEnd && !showHistory) contentScroll.fullScroll(View.FOCUS_DOWN);
             else contentScroll.scrollTo(0, scrollY);
         });
+    }
+
+    private void openHistory() {
+        hideKeyboard();
+        setupPanel.setVisibility(View.GONE);
+        setupToggle.setText("连接与设置  ›");
+        navigate(true, "");
+        contentScroll.scrollTo(0, 0);
+    }
+
+    private void deleteConversation(String id) {
+        try {
+            if (!controller.deleteConversation(id)) { renderHistory(true); return; }
+            drafts.remove(id);
+            if (id.equals(unsavedConversationId)) { unsavedConversationId = ""; unsavedOutput = ""; }
+            if (id.equals(selectedConversationId)) {
+                selectedConversationId = ""; showHistory = true;
+                prompt.setText(drafts.containsKey("new-task") ? drafts.get("new-task") : "");
+            }
+            renderHistory(true); refreshState();
+            toast("已删除任务记录");
+        } catch (java.io.IOException unavailable) {
+            toast(unavailable.getMessage() == null ? "暂时无法删除，请重试。" : unavailable.getMessage());
+        }
     }
 
     private String draftKey() { return !showHistory && !selectedConversationId.isEmpty() ? selectedConversationId : "new-task"; }

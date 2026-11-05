@@ -101,6 +101,28 @@ python3 scripts/test-device.py taskstore
 python3 scripts/test-device.py history
 ```
 
+## Deletion persistence and running-task protection
+
+`delete` uses isolated cache-backed history and last-task files. It deletes the currently saved conversation, checks that only its linked last-task is cleared, confirms another conversation is unchanged, rebuilds Controller, then resets the remaining conversation and rebuilds again. That reset must persist acknowledgment of only the remaining turn and restore idle/setup presentation without changing its history or reviving the deleted record. It then deletes the final record and verifies empty history stays empty. A separate migrated legacy fixture must also remain deleted when an old last-task snapshot is supplied again. An isolated synthetic CLI session file is retained throughout; deleting app history must not remove CLI files.
+
+The final lifecycle check launches the actual installed CLI against **only the unreachable local address `http://127.0.0.1:9`**, using the disposable test key. While that process is alive, deleting its active conversation must be rejected. Deleting an unrelated old fixture must leave the active ID, process reference, running state, presentation epoch and last-task record unchanged. The test then stops the local task and checks persistence. No fixture server, reversed port or real model is used. The installed runtime and accessibility service must be available. This local launch can leave one new test CLI session in the Linux home; Android user history and model settings are untouched.
+
+```bash
+python3 scripts/test-device.py delete
+```
+
+## Recent-task navigation and swipe-to-delete
+
+`historyui` temporarily presents an isolated Controller with five synthetic conversations in the real MainActivity. It verifies the default view is not the recent-task list, the task-record button explicitly opens that list, and “连接与设置” and the history entry remain above the scrolling content. Opening recent tasks closes the settings panel. No connection field is read or changed.
+
+Real `Instrumentation.sendPointerSync` touchscreen gestures run against those fixture rows. A predominantly vertical movement must neither open the conversation nor reveal/delete it; a left swipe exposes a Delete button on the right without opening or deleting; a right swipe closes it. A vertical gesture beginning on an already exposed Delete button must also cancel its pending click without deleting. Only a subsequent real tap on the exposed Delete button removes the selected fixture. The test reconstructs history to verify the deletion persists, then checks a normal tap on a closed row opens its detail and the task-record entry returns to the updated list. It never sends a task or contacts a model. The original Controller, selected view, drafts, expanded processes, setup visibility and scroll position are restored, and only the isolated fixture directory is removed.
+
+Before repositioning rows between gestures, the harness sends ScrollView a local DOWN/CANCEL pair to end any previous fling, then scrolls to the fixture. `scrollTo` and `waitForIdleSync` alone do not stop Android's OverScroller. Touch coordinates come from local visible bounds plus the view's screen location. Passive event logs report fixture attachment/current identity, screen/viewport bounds, scroll offset and DOWN/MOVE/UP/CANCEL routing without recording page content.
+
+```bash
+python3 scripts/test-device.py historyui
+```
+
 ## Real Claude session continuation
 
 Start the updated local fixture and reverse port 18080 as described above, then run:

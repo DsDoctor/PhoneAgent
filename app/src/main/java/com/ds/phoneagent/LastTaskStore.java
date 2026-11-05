@@ -44,6 +44,23 @@ final class LastTaskStore {
         } catch (Exception unavailable) { return null; }
     }
 
+    /** Compare and delete under the same lock so deleting older history cannot erase a newer task. */
+    synchronized boolean clearIfUnchanged(JSONObject expected) throws IOException {
+        JSONObject current = read();
+        if (expected == null || current == null || !current.toString().equals(expected.toString())) return false;
+        file.delete();
+        File base = file.getBaseFile();
+        if (base.exists() || new File(base.getPath() + ".bak").exists() || new File(base.getPath() + ".new").exists())
+            throw new IOException("无法清理上一任务记录，请重试。");
+        return true;
+    }
+
+    /** Roll back a failed history deletion without replacing a task started in the meantime. */
+    synchronized void restoreIfEmpty(JSONObject previous) throws IOException {
+        File base = file.getBaseFile();
+        if (!base.exists() && !new File(base.getPath() + ".bak").exists() && !new File(base.getPath() + ".new").exists()) write(previous);
+    }
+
     synchronized JSONObject recoverInterrupted() {
         JSONObject record = read();
         if (record == null || !"running".equals(record.optString("state"))) return record;
@@ -69,8 +86,19 @@ final class LastTaskStore {
 
     /** Acknowledge the presentation without changing the historical task outcome or text. */
     synchronized boolean acknowledge() {
+        return acknowledge(null);
+    }
+
+    /** After deletion, the selected remaining turn can provide an explicit acknowledgement record. */
+    synchronized boolean acknowledge(JSONObject fallback) {
         JSONObject record = read();
-        if (record == null) return true;
+        if (record == null) {
+            File base = file.getBaseFile();
+            if (base.exists() || new File(base.getPath() + ".bak").exists() || new File(base.getPath() + ".new").exists()) return false;
+            if (fallback == null) return true;
+            record = normalize(fallback);
+            if (record == null) return false;
+        }
         if ("running".equals(record.optString("state"))) return false;
         try {
             record.put("acknowledged", true);

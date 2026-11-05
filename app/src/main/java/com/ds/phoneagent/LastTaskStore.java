@@ -121,6 +121,10 @@ final class LastTaskStore {
             Integer exit = optionalInt(source, "exit_code"), turns = optionalInt(source, "num_turns");
             if (exit != null) result.put("exit_code", exit);
             if (turns != null) result.put("num_turns", turns);
+            for (String field : new String[]{"conversation_id", "turn_id", "session_id"}) {
+                String value = source.optString(field);
+                if (LinuxRuntime.isSessionId(value)) result.put(field, value);
+            }
             return result;
         } catch (Exception invalid) { return null; }
     }

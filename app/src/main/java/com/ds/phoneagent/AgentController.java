@@ -22,6 +22,7 @@ public final class AgentController {
         void onOutput(String output);
         void onFinished(boolean success, String message);
         default void onVisualState(VisualState state) { }
+        default void onHistoryChanged() { }
     }
     private static AgentController instance;
     public static synchronized AgentController get(Context context) {
@@ -31,6 +32,7 @@ public final class AgentController {
     private final Context context;
     private final LinuxRuntime runtime;
     private final LastTaskStore taskStore;
+    private final TaskHistoryStore historyStore;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private volatile Listener listener;
@@ -41,14 +43,21 @@ public final class AgentController {
     private final AtomicLong presentationEpoch = new AtomicLong();
     private volatile String lastStatus = "先准备运行环境，再配置模型和手机权限。";
     private volatile String lastOutput = "";
+    private volatile String activeConversationId = "";
 
     private AgentController(Context context) {
+        this(context, new LinuxRuntime(context));
+    }
+    AgentController(Context context, LinuxRuntime runtime) {
         this.context = context;
-        runtime = new LinuxRuntime(context);
+        this.runtime = runtime;
         taskStore = new LastTaskStore(context);
+        historyStore = new TaskHistoryStore(context);
         if (runtime.isInstalled()) lastStatus = "运行环境已就绪，连接模型后即可执行。";
         else visualState = VisualState.NEEDS_INPUT;
         JSONObject previous = taskStore.recoverInterrupted();
+        try { historyStore.initialize(previous); }
+        catch (IOException unavailable) { /* The previous task stays visible; new runs report storage failure. */ }
         if (previous != null) {
             lastStatus = previous.optString("status");
             lastOutput = previous.optString("output");
@@ -61,18 +70,70 @@ public final class AgentController {
                 lastStatus = ready ? "已重置为待命，可以开始新任务。" : "运行环境尚未就绪，请先准备运行环境。";
             }
         }
+        String previousId = previous == null ? "" : previous.optString("conversation_id");
+        activeConversationId = historyStore.getConversation(previousId) != null ? previousId : historyStore.latestId();
+        JSONObject newest = historyStore.getConversation(historyStore.latestId());
+        JSONArray latestTurns = newest == null ? null : newest.optJSONArray("turns");
+        JSONObject latestTurn = latestTurns == null || latestTurns.length() == 0
+                ? null : latestTurns.optJSONObject(latestTurns.length() - 1);
+        if (latestTurn != null && (previous == null || (!latestTurn.optString("id").equals(previous.optString("turn_id"))
+                && newest.optLong("updated_at") > previous.optLong("updated_at")))) {
+            // Recover a crash between persisting the new prompt and updating last-task.json.
+            activeConversationId = newest.optString("id");
+            lastStatus = latestTurn.optString("status");
+            lastOutput = latestTurn.optString("output");
+            String state = latestTurn.optString("state");
+            visualState = state.equals("success") ? VisualState.SUCCESS
+                    : state.equals("stopped") ? VisualState.STOPPED : VisualState.ERROR;
+        }
         // A persisted record can restore presentation, never a running process.
     }
     public void setListener(Listener listener) {
         this.listener = listener;
         main.post(() -> { if (this.listener == listener) {
             listener.onStatus(lastStatus); listener.onOutput(lastOutput); listener.onVisualState(visualState);
+            listener.onHistoryChanged();
         } });
     }
     public void removeListener(Listener listener) { if (this.listener == listener) this.listener = null; }
     public boolean isRunning() { return running; }
     public boolean isReady() { return runtime.isInstalled(); }
     public VisualState getVisualState() { return visualState; }
+    public String getActiveConversationId() { return activeConversationId; }
+    public JSONArray getConversations() {
+        JSONArray summaries = historyStore.summaries();
+        for (int i = 0; i < summaries.length(); i++) addAvailability(summaries.optJSONObject(i));
+        return summaries;
+    }
+    public JSONObject getConversation(String id) {
+        JSONObject conversation = historyStore.getConversation(id);
+        addAvailability(conversation);
+        return conversation;
+    }
+    public synchronized String importConversation(JSONObject conversation) throws IOException {
+        if (running) throw new IOException("请等待当前任务结束后导入会话。");
+        String id = historyStore.importConversation(conversation);
+        if (activeConversationId.isEmpty()) activeConversationId = id;
+        historyChanged(presentationEpoch.get());
+        return id;
+    }
+    private void addAvailability(JSONObject conversation) {
+        if (conversation == null) return;
+        String session = conversation.optString("session_id");
+        String explanation = "";
+        if (!LinuxRuntime.isSessionId(session)) explanation = "这条旧任务没有保存可恢复的会话，请新建任务。";
+        else if (!runtime.hasClaudeSession(session)) explanation = "原会话文件已丢失，无法继续；请新建任务。";
+        else if (running) explanation = "请等待当前任务结束后继续。";
+        try { conversation.put("can_continue", explanation.isEmpty()).put("continue_unavailable_reason", explanation); }
+        catch (Exception ignored) { }
+    }
+    private void historyChanged(long epoch) {
+        main.post(() -> {
+            if (epoch != presentationEpoch.get()) return;
+            Listener l = listener;
+            if (l != null) l.onHistoryChanged();
+        });
+    }
     public boolean canResetToIdle() {
         if (running) return false;
         VisualState current = visualState;
@@ -129,6 +190,8 @@ public final class AgentController {
                 if (epoch != presentationEpoch.get()) return;
                 Listener l = listener;
                 if (l != null) {
+                    l.onHistoryChanged();
+                    if (epoch != presentationEpoch.get()) return;
                     l.onOutput(lastOutput);
                     if (epoch != presentationEpoch.get()) return;
                     l.onStatus(message);
@@ -194,6 +257,9 @@ public final class AgentController {
         });
     }
     public void run(String prompt, String baseUrl, String model, String apiKey) {
+        runInConversation("", prompt, baseUrl, model, apiKey);
+    }
+    public void runInConversation(String conversationId, String prompt, String baseUrl, String model, String apiKey) {
         if (running) return;
         if (prompt == null || prompt.trim().isEmpty()) { needsInput("先输入要手机完成的事情。"); return; }
         if (!isReady()) { needsInput("请先准备运行环境。"); return; }
@@ -207,22 +273,41 @@ public final class AgentController {
         if (model == null || apiKey == null || model.trim().isEmpty() || apiKey.trim().isEmpty()) {
             needsInput("请先填写模型名和 API Key。"); return;
         }
+        String resumeSession = "";
+        if (conversationId != null && !conversationId.isEmpty()) {
+            JSONObject existing = getConversation(conversationId);
+            if (existing == null) { needsInput("这条任务记录已不存在，请新建任务。"); return; }
+            if (!existing.optBoolean("can_continue")) { needsInput(existing.optString("continue_unavailable_reason")); return; }
+            resumeSession = existing.optString("session_id");
+        }
         final long epoch = begin();
         if (epoch < 0) return;
+        final TaskRun task;
+        try {
+            JSONObject started = historyStore.beginTurn(conversationId, redactText(prompt.trim(), apiKey.trim(), baseUrl.trim()));
+            activeConversationId = started.getString("conversation_id");
+            task = new TaskRun(epoch, apiKey.trim(), baseUrl.trim(), started, prompt.trim());
+        } catch (Exception unavailable) {
+            running = false;
+            needsInput("无法保存任务会话，请检查手机存储后重试。");
+            return;
+        }
+        final String session = resumeSession;
+        task.progress(session.isEmpty() ? "正在连接模型…" : "正在恢复原会话…");
+        historyChanged(epoch);
         phase(epoch, VisualState.THINKING, "正在连接模型…");
-        worker.execute(() -> runTask(epoch, prompt.trim(), baseUrl.trim(), model.trim(), apiKey.trim()));
+        worker.execute(() -> runTask(task, prompt.trim(), baseUrl.trim(), model.trim(), apiKey.trim(), session));
     }
 
-    private void runTask(long epoch, String prompt, String baseUrl, String model, String apiKey) {
+    private void runTask(TaskRun task, String prompt, String baseUrl, String model, String apiKey, String resumeSession) {
+        long epoch = task.epoch;
         PowerManager.WakeLock lock = null;
-        TaskRun task = new TaskRun(epoch, apiKey, baseUrl);
         boolean ok = false, sawResult = false;
         Integer exitCode = null, turns = null;
         String reason = "cli_no_result", detail = "执行进程结束，但没有返回最终结果。";
         String errorCategory = "";
         Process child = null;
         PhoneToolServer server = null;
-        task.progress("正在连接模型…");
         try {
             lock = wakeLock();
             if (cancelled) throw new CancellationException();
@@ -239,7 +324,7 @@ public final class AgentController {
             });
             bridge = server;
             if (cancelled) throw new CancellationException();
-            child = runtime.startClaude(prompt, baseUrl, model, apiKey, server.port(), server.token());
+            child = runtime.startClaude(prompt, baseUrl, model, apiKey, server.port(), server.token(), resumeSession);
             process = child;
             if (cancelled) { terminate(child); throw new CancellationException(); }
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(child.getInputStream(), "UTF-8"))) {
@@ -254,6 +339,9 @@ public final class AgentController {
                         continue;
                     }
                     String type = event.optString("type");
+                    if (type.equals("result") || (type.equals("system") && event.optString("subtype").equals("init"))) {
+                        task.captureSession(event.optString("session_id"), resumeSession);
+                    }
                     if (type.equals("assistant")) {
                         JSONObject msg = event.optJSONObject("message");
                         JSONArray content = msg == null ? null : msg.optJSONArray("content");
@@ -294,7 +382,13 @@ public final class AgentController {
             }
         } catch (Exception failure) {
             ok = false;
-            if (!sawResult) {
+            if (failure instanceof LinuxRuntime.MissingSessionException) {
+                reason = "session_missing";
+                detail = "原会话文件已丢失，无法继续；没有创建新会话。";
+            } else if (failure instanceof SessionMismatchException) {
+                reason = "session_mismatch";
+                detail = "执行进程返回的会话与原会话不符，已停止执行。";
+            } else if (!sawResult) {
                 reason = "cli_no_result";
                 detail = child == null ? "执行进程未能启动，没有返回最终结果。" : "执行连接中断，没有收到最终结果。";
             } else {
@@ -316,6 +410,11 @@ public final class AgentController {
             finishing = true;
             if (cancelled) { ok = false; reason = "user_stop"; detail = "用户手动停止了任务。"; }
         }
+        if (!cancelled && !sawResult && !resumeSession.isEmpty() && !task.sessionConfirmed
+                && !reason.equals("session_missing") && !reason.equals("session_mismatch")) {
+            reason = "resume_failed";
+            detail = "原会话未能恢复，执行进程没有返回最终结果；没有创建新会话。";
+        }
         if (!cancelled && !sawResult && !errorCategory.isEmpty()) detail += "\n错误类别：" + errorCategory;
         String state = cancelled ? "stopped" : ok ? "success" : "error";
         String message = cancelled ? "已停止任务，记录已保留。" : ok ? "本次指令已结束。" : "本次指令未完成，请查看任务记录。";
@@ -325,11 +424,30 @@ public final class AgentController {
 
     /** Serializes output and persistence from the CLI reader and the tool observer. */
     private final class TaskRun {
-        final long epoch, startedAt = System.currentTimeMillis();
-        final String key, endpoint;
-        String transcript = "", status = "正在连接模型…";
-        boolean done, sawDiagnostic, saveFailed;
-        TaskRun(long epoch, String key, String endpoint) { this.epoch = epoch; this.key = key; this.endpoint = endpoint; }
+        final long epoch, startedAt;
+        final String key, endpoint, conversationId, turnId, prompt;
+        String transcript = "", processText = "", finalResult = "", terminalText = "", sessionId;
+        String status = "正在连接模型…";
+        boolean done, sawDiagnostic, saveFailed, sessionConfirmed;
+        TaskRun(long epoch, String key, String endpoint, JSONObject started, String prompt) throws Exception {
+            this.epoch = epoch; this.key = key; this.endpoint = endpoint;
+            this.conversationId = started.getString("conversation_id");
+            this.turnId = started.getString("turn_id");
+            this.sessionId = started.optString("session_id");
+            this.startedAt = started.getLong("started_at");
+            this.prompt = LastTaskStore.tail(redact(prompt));
+        }
+        synchronized void captureSession(String value, String requested) throws IOException {
+            if (!LinuxRuntime.isSessionId(value)) return;
+            String normalized = value.toLowerCase(java.util.Locale.US);
+            if ((!requested.isEmpty() && !requested.equalsIgnoreCase(normalized))
+                    || (!sessionId.isEmpty() && !sessionId.equals(normalized))) throw new SessionMismatchException();
+            sessionConfirmed = true;
+            if (normalized.equals(sessionId)) return;
+            historyStore.bindSession(conversationId, normalized);
+            sessionId = normalized;
+            save("running", "", null, null, 0);
+        }
         synchronized void progress(String message) {
             if (done) return;
             status = message;
@@ -339,11 +457,22 @@ public final class AgentController {
             if (!sawDiagnostic) { sawDiagnostic = true; progress("执行进程返回诊断信息，正在等待最终结果。"); }
         }
         synchronized void appendResult(String text) {
-            if (!transcript.contains(redact(text))) append(text);
+            if (done || text == null) return;
+            finalResult = LastTaskStore.tail(redact(text));
+            // The CLI also emits its final prose as an assistant event; move that same text to Results.
+            if (!finalResult.isEmpty()) {
+                if (processText.equals(finalResult)) processText = "";
+                else if (processText.endsWith("\n\n" + finalResult))
+                    processText = processText.substring(0, processText.length() - finalResult.length() - 2);
+            }
+            rebuildOutput();
+            save("running", "", null, null, 0);
+            output(epoch, transcript);
         }
         synchronized void append(String text) {
             if (done || text == null || text.isEmpty()) return;
-            transcript = LastTaskStore.tail(transcript + (transcript.isEmpty() ? "" : "\n\n") + redact(text));
+            processText = LastTaskStore.tail(processText + (processText.isEmpty() ? "" : "\n\n") + redact(text));
+            rebuildOutput();
             save("running", "", null, null, 0);
             output(epoch, transcript);
         }
@@ -351,32 +480,52 @@ public final class AgentController {
             done = true;
             status = message;
             String label = state.equals("success") ? "完成" : state.equals("stopped") ? "已停止" : "未完成";
-            transcript = LastTaskStore.tail(transcript + "\n\n" + redact(LastTaskStore.terminalFooter(label, detail, exit, turns)));
+            terminalText = redact(LastTaskStore.terminalFooter(label, detail, exit, turns));
+            rebuildOutput();
             long ended = System.currentTimeMillis();
             save(state, reason, exit, turns, ended);
             if (saveFailed) {
-                transcript = LastTaskStore.tail(transcript + "\n记录暂时无法保存，当前仍可查看。");
+                terminalText += "\n记录暂时无法保存，当前仍可查看。";
+                rebuildOutput();
                 save(state, reason, exit, turns, ended);
             }
             return transcript;
         }
+        private void rebuildOutput() {
+            StringBuilder combined = new StringBuilder(processText);
+            for (String part : new String[]{finalResult, terminalText}) {
+                if (part.isEmpty()) continue;
+                if (combined.length() > 0) combined.append("\n\n");
+                combined.append(part);
+            }
+            transcript = LastTaskStore.tail(combined.toString());
+        }
         private void save(String state, String reason, Integer exit, Integer turns, long ended) {
+            saveFailed = false;
             try {
                 JSONObject record = new JSONObject().put("version", 1).put("state", state)
                         .put("status", redact(status)).put("output", transcript).put("reason", reason)
+                        .put("conversation_id", conversationId).put("turn_id", turnId).put("session_id", sessionId)
                         .put("started_at", startedAt).put("updated_at", System.currentTimeMillis()).put("ended_at", ended);
                 if (exit != null) record.put("exit_code", exit);
                 if (turns != null) record.put("num_turns", turns);
-                taskStore.write(record);
-                saveFailed = false;
+                try { taskStore.write(record); } catch (IOException unavailable) { saveFailed = true; }
+                JSONObject turn = new JSONObject(record.toString()).put("id", turnId).put("prompt", prompt)
+                        .put("process", processText).put("result", finalResult).put("terminal", terminalText);
+                try { historyStore.updateTurn(conversationId, turnId, turn); }
+                catch (IOException unavailable) { saveFailed = true; }
             } catch (Exception unavailable) { saveFailed = true; }
+            historyChanged(epoch);
         }
-        private String redact(String text) {
-            String safe = text.replace(key, "[已隐藏]").replace(endpoint, "[服务地址已隐藏]");
-            return safe.replaceAll("(?i)((?:proxy-)?authorization[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\r\\n\\\"'}]+", "$1[已隐藏]")
-                    .replaceAll("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]+", "$1[已隐藏]")
-                    .replaceAll("(?i)((?:x-api-key|api[_-]?key)\\s*[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\s,;\\\"'}]+", "$1[已隐藏]");
-        }
+        private String redact(String text) { return redactText(text, key, endpoint); }
+    }
+
+    private static final class SessionMismatchException extends IOException { }
+    private static String redactText(String text, String key, String endpoint) {
+        String safe = text.replace(key, "[已隐藏]").replace(endpoint, "[服务地址已隐藏]");
+        return safe.replaceAll("(?i)((?:proxy-)?authorization[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\r\\n\\\"'}]+", "$1[已隐藏]")
+                .replaceAll("(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]+", "$1[已隐藏]")
+                .replaceAll("(?i)((?:x-api-key|api[_-]?key)\\s*[\\\"']?\\s*[:=]\\s*[\\\"']?)[^\\s,;\\\"'}]+", "$1[已隐藏]");
     }
 
     public void stop() {

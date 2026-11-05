@@ -22,6 +22,17 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Locale;
+import java.util.Set;
 import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import java.security.KeyStore;
@@ -38,10 +49,18 @@ public final class MainActivity extends Activity {
     private static final String KEY_ALIAS = "phoneagent.api.key.v1";
     private AgentController controller;
     private SharedPreferences preferences;
-    private TextView state, output, capabilities;
+    private TextView state, capabilities;
     private EditText prompt, baseUrl, model, apiKey;
     private Button send, stop, prepare, control, bubble;
-    private LinearLayout modelFields;
+    private LinearLayout modelFields, setupPanel, historyPanel;
+    private String selectedConversationId = "";
+    private boolean showHistory = true;
+    private String renderedHistory = "";
+    private long historyRenderVersion;
+    private int visibleTurnLimit = 10;
+    private String unsavedOutput = "", unsavedConversationId = "";
+    private final Map<String, String> drafts = new HashMap<>();
+    private final Set<String> expandedProcesses = new HashSet<>();
     private ScrollView contentScroll;
     private MonthlyCatView statePet;
 
@@ -51,24 +70,21 @@ public final class MainActivity extends Activity {
         }
         @Override public void onOutput(String text) {
             runOnUiThread(() -> {
-                if (text != null && !text.isEmpty()) {
-                    output.setText(text);
-                    if (!controller.isRunning() && text.contains("【任务结束】"))
-                        contentScroll.post(() -> contentScroll.fullScroll(View.FOCUS_DOWN));
-                }
-                else if (controller.isRunning()) output.setText("任务已开始，正在等待执行进度…");
-                else if (controller.getVisualState() == AgentController.VisualState.ERROR
-                        || controller.getVisualState() == AgentController.VisualState.STOPPED
-                        || controller.getVisualState() == AgentController.VisualState.SUCCESS)
-                    output.setText("本次任务没有可显示的正文，请查看上方状态。");
-                else output.setText(welcome());
+                boolean failed = text != null && text.contains("记录暂时无法保存");
+                boolean hadFallback = !unsavedOutput.isEmpty();
+                unsavedOutput = failed ? text : "";
+                unsavedConversationId = failed ? controller.getActiveConversationId() : "";
+                if (failed || hadFallback) renderHistory(true);
             });
+        }
+        @Override public void onHistoryChanged() {
+            runOnUiThread(() -> { renderHistory(false); refreshState(); });
         }
         @Override public void onFinished(boolean success, String message) {
             runOnUiThread(() -> {
                 state.setText(message);
                 refreshState();
-                contentScroll.post(() -> contentScroll.fullScroll(View.FOCUS_DOWN));
+                renderHistory(false);
             });
         }
         @Override public void onVisualState(AgentController.VisualState value) {
@@ -85,7 +101,19 @@ public final class MainActivity extends Activity {
         model.setText(preferences.getString("model", ""));
         apiKey.setText(loadKey());
         modelFields.setVisibility(baseUrl.length() == 0 || model.length() == 0 ? View.VISIBLE : View.GONE);
-        if (savedState != null) prompt.setText(savedState.getString("draft", ""));
+        if (savedState != null) {
+            prompt.setText(savedState.getString("draft", ""));
+            selectedConversationId = savedState.getString("conversation", "");
+            showHistory = savedState.getBoolean("history", true);
+            Bundle savedDrafts = savedState.getBundle("drafts");
+            if (savedDrafts != null) for (String key : savedDrafts.keySet())
+                drafts.put(key, savedDrafts.getString(key, ""));
+        } else if (controller.isRunning()) {
+            selectedConversationId = controller.getActiveConversationId();
+            showHistory = false;
+        }
+        setupPanel.setVisibility(!controller.isReady() || baseUrl.length() == 0 || model.length() == 0 ? View.VISIBLE : View.GONE);
+        renderHistory(true);
         controller.setListener(listener);
     }
 
@@ -102,7 +130,13 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onSaveInstanceState(Bundle outState) {
+        stashDraft();
+        Bundle savedDrafts = new Bundle();
+        for (Map.Entry<String, String> entry : drafts.entrySet()) savedDrafts.putString(entry.getKey(), entry.getValue());
+        outState.putBundle("drafts", savedDrafts);
         outState.putString("draft", prompt.getText().toString());
+        outState.putString("conversation", selectedConversationId);
+        outState.putBoolean("history", showHistory);
         super.onSaveInstanceState(outState);
     }
 
@@ -129,6 +163,30 @@ public final class MainActivity extends Activity {
         LinearLayout content = vertical();
         contentScroll.addView(content);
 
+        LinearLayout navigation = horizontal();
+        Button history = button("任务记录", false);
+        Button fresh = button("＋ 新任务", true);
+        navigation.addView(history, weighted());
+        navigation.addView(fresh, weighted());
+        content.addView(navigation, spaced());
+        history.setOnClickListener(view -> {
+            hideKeyboard(); navigate(true, "");
+            contentScroll.smoothScrollTo(0, 0);
+        });
+        fresh.setOnClickListener(view -> {
+            navigate(false, "");
+            contentScroll.smoothScrollTo(0, 0);
+        });
+
+        historyPanel = vertical();
+        content.addView(historyPanel);
+        Button setupToggle = button("设置与连接  ›", false);
+        content.addView(setupToggle, spaced());
+        setupPanel = vertical();
+        content.addView(setupPanel);
+        setupToggle.setOnClickListener(view -> setupPanel.setVisibility(
+                setupPanel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
+
         LinearLayout setup = card();
         LinearLayout statusRow = horizontal();
         statusRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -140,7 +198,9 @@ public final class MainActivity extends Activity {
         state = text("先准备环境，再开启手机控制", 15, INK);
         state.setTypeface(Typeface.DEFAULT_BOLD);
         statusRow.addView(state, new LinearLayout.LayoutParams(0, -2, 1));
-        setup.addView(statusRow);
+        LinearLayout statusCard = card();
+        statusCard.addView(statusRow);
+        content.addView(statusCard, 1, spaced());
         capabilities = text("", 12, MUTED);
         capabilities.setPadding(0, dp(7), 0, dp(8));
         setup.addView(capabilities);
@@ -152,7 +212,7 @@ public final class MainActivity extends Activity {
         setup.addView(setupRow);
         bubble = button("开启悬浮球", false);
         setup.addView(bubble, new LinearLayout.LayoutParams(-1, dp(46)));
-        content.addView(setup, spaced());
+        setupPanel.addView(setup, spaced());
 
         prepare.setOnClickListener(view -> {
             hideKeyboard();
@@ -194,18 +254,7 @@ public final class MainActivity extends Activity {
             modelFields.setVisibility(View.GONE);
         });
         settings.setOnClickListener(view -> modelFields.setVisibility(modelFields.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
-        content.addView(modelCard, spaced());
-
-        LinearLayout conversation = card();
-        TextView conversationTitle = text("任务记录", 14, MUTED);
-        conversationTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        conversation.addView(conversationTitle);
-        output = text(welcome(), 16, INK);
-        output.setTextIsSelectable(true);
-        output.setLineSpacing(dp(4), 1);
-        output.setPadding(0, dp(12), 0, dp(4));
-        conversation.addView(output);
-        content.addView(conversation, spaced());
+        setupPanel.addView(modelCard, spaced());
 
         LinearLayout composer = vertical();
         composer.setPadding(0, dp(12), 0, 0);
@@ -252,6 +301,7 @@ public final class MainActivity extends Activity {
         if (!controller.isReady()) { toast("请先准备环境"); return; }
         if (!PhoneAccessibilityService.isEnabled()) { toast("请先开启 PhoneAgent 手机控制"); return; }
         if (endpoint.isEmpty() || chosenModel.isEmpty() || secret.isEmpty()) {
+            setupPanel.setVisibility(View.VISIBLE);
             modelFields.setVisibility(View.VISIBLE);
             toast("请填写模型服务地址、模型名称和 API Key");
             return;
@@ -264,12 +314,25 @@ public final class MainActivity extends Activity {
         } catch (Exception invalid) {
             toast("请填写 HTTPS 服务地址；仅本机服务允许 HTTP。"); return;
         }
+        if (!selectedConversationId.isEmpty() && !showHistory) {
+            JSONObject conversation = controller.getConversation(selectedConversationId);
+            if (conversation == null || !conversation.optBoolean("can_continue")) {
+                toast(conversation == null ? "这段对话已不可用，请新建任务。"
+                        : conversation.optString("continue_unavailable_reason", "这段对话暂时无法继续，请新建任务。"));
+                return;
+            }
+        }
         saveSettings();
         hideKeyboard();
-        controller.run(task, endpoint, chosenModel, secret);
+        String submittedDraft = draftKey();
+        controller.runInConversation(showHistory ? "" : selectedConversationId, task, endpoint, chosenModel, secret);
         refreshState();
         if (controller.isRunning()) {
+            drafts.remove(submittedDraft);
+            selectedConversationId = controller.getActiveConversationId();
+            showHistory = false;
             prompt.setText("");
+            renderHistory(true);
             moveTaskToBack(true);
         }
     }
@@ -288,9 +351,188 @@ public final class MainActivity extends Activity {
         prepare.setEnabled(!running && !ready);
         control.setText(accessible ? "手机控制设置" : "开启手机控制");
         bubble.setText(!overlay ? "开启悬浮球权限" : preferences.getBoolean("bubble_enabled", true) ? "隐藏悬浮球" : "显示悬浮球");
-        send.setEnabled(!running);
+        boolean continuing = !showHistory && !selectedConversationId.isEmpty();
+        JSONObject selected = continuing ? controller.getConversation(selectedConversationId) : null;
+        boolean canContinue = selected != null && selected.optBoolean("can_continue");
+        send.setText(continuing ? "继续对话" : "开始执行");
+        send.setEnabled(!running && (!continuing || canContinue));
+        prompt.setHint(continuing ? "继续追问，或让月薪喵接着操作…" : "例如：打开大麦，看看北京的演唱会");
         stop.setText(running ? "停止" : "重置");
         stop.setEnabled(running || controller.canResetToIdle());
+    }
+
+    @Override public void onBackPressed() {
+        if (!showHistory) {
+            navigate(true, "");
+            contentScroll.smoothScrollTo(0, 0);
+        } else super.onBackPressed();
+    }
+
+    private void renderHistory(boolean force) {
+        if (historyPanel == null) return;
+        JSONObject detail = !showHistory && !selectedConversationId.isEmpty()
+                ? controller.getConversation(selectedConversationId) : null;
+        JSONArray conversations = showHistory ? controller.getConversations() : null;
+        String fingerprint = showHistory + ":" + selectedConversationId + ":"
+                + (showHistory ? conversations.toString() : detail == null ? "" : detail.toString())
+                + ":" + expandedProcesses.toString();
+        if (!force && fingerprint.equals(renderedHistory)) return;
+        renderedHistory = fingerprint;
+        long rendering = ++historyRenderVersion;
+        int scrollY = contentScroll.getScrollY();
+        boolean atEnd = contentScroll.getChildAt(0).getHeight() - contentScroll.getHeight() - scrollY < dp(80);
+        historyPanel.removeAllViews();
+        if (showHistory) {
+            TextView label = text("最近任务 · 保留 20 个会话", 13, MUTED);
+            label.setPadding(0, dp(2), 0, dp(12)); historyPanel.addView(label);
+            if (conversations.length() == 0) {
+                LinearLayout empty = card(); empty.addView(text(welcome(), 16, INK));
+                historyPanel.addView(empty, spaced());
+            }
+            for (int i = 0; i < conversations.length(); i++) {
+                JSONObject entry = conversations.optJSONObject(i);
+                if (entry == null) continue;
+                final String id = entry.optString("id");
+                LinearLayout item = card();
+                TextView title = text(entry.optString("title", "手机任务"), 17, INK);
+                title.setTypeface(Typeface.DEFAULT_BOLD); title.setMaxLines(2); item.addView(title);
+                TextView meta = text(date(entry.optLong("updated_at")) + "  ·  " + stateLabel(entry.optString("status"))
+                        + "  ·  " + entry.optInt("turn_count", 1) + " 轮对话", 12, MUTED);
+                meta.setPadding(0, dp(7), 0, dp(8)); item.addView(meta);
+                String preview = entry.optString("last_result").replaceAll("[\\r\\n]+", " ");
+                if (!preview.isEmpty()) {
+                    TextView excerpt = text(preview, 14, MUTED); excerpt.setMaxLines(2); item.addView(excerpt);
+                }
+                TextView open = text("查看结果与过程  ›", 13, GREEN); open.setPadding(0, dp(9), 0, 0); item.addView(open);
+                item.setContentDescription(entry.optString("title") + "，" + stateLabel(entry.optString("status")) + "，查看任务");
+                item.setClickable(true); item.setFocusable(true);
+                item.setOnClickListener(view -> openConversation(id));
+                historyPanel.addView(item, spaced());
+            }
+        } else if (detail == null) {
+            LinearLayout empty = card();
+            TextView heading = text(selectedConversationId.isEmpty() ? "想让月薪喵做什么？" : "这段对话已不在近期记录中", 18, INK);
+            heading.setTypeface(Typeface.DEFAULT_BOLD); empty.addView(heading);
+            TextView help = text(selectedConversationId.isEmpty() ? "在下方输入任务，完成后可以继续追问。" : "点“新任务”开始一段新对话。", 14, MUTED);
+            help.setPadding(0, dp(10), 0, 0); empty.addView(help); historyPanel.addView(empty, spaced());
+        } else {
+            TextView heading = text(detail.optString("title", "手机任务"), 20, INK);
+            heading.setTypeface(Typeface.DEFAULT_BOLD); heading.setPadding(0, dp(2), 0, dp(12));
+            historyPanel.addView(heading);
+            JSONArray turns = detail.optJSONArray("turns");
+            if (turns != null) {
+                int start = Math.max(0, turns.length() - visibleTurnLimit);
+                if (start > 0) {
+                    Button older = button("显示更早对话（还有 " + start + " 轮）", false);
+                    older.setOnClickListener(view -> { visibleTurnLimit += 10; renderHistory(true); });
+                    historyPanel.addView(older, spaced());
+                }
+                for (int i = start; i < turns.length(); i++) {
+                    JSONObject turn = turns.optJSONObject(i); if (turn == null) continue;
+                    addTurn(turn, i + 1);
+                }
+            }
+            if (selectedConversationId.equals(unsavedConversationId) && !unsavedOutput.isEmpty()) {
+                LinearLayout fallback = card();
+                TextView label = text("本轮记录暂未保存 · 请先复制", 14, GREEN);
+                label.setTypeface(Typeface.DEFAULT_BOLD); fallback.addView(label);
+                TextView available = text(unsavedOutput, 14, INK);
+                available.setTextIsSelectable(true); available.setPadding(0, dp(10), 0, 0);
+                fallback.addView(available); historyPanel.addView(fallback, spaced());
+            }
+            if (!detail.optBoolean("can_continue") && !"running".equals(detail.optString("status"))) {
+                TextView note = text(detail.optString("continue_unavailable_reason", "这段对话暂时无法继续，可以新建任务。"), 12, MUTED);
+                note.setPadding(0, dp(2), 0, dp(14)); historyPanel.addView(note);
+            }
+        }
+        if (!force) contentScroll.post(() -> {
+            if (rendering != historyRenderVersion || isFinishing() || isDestroyed()) return;
+            if (atEnd && !showHistory) contentScroll.fullScroll(View.FOCUS_DOWN);
+            else contentScroll.scrollTo(0, scrollY);
+        });
+    }
+
+    private String draftKey() { return !showHistory && !selectedConversationId.isEmpty() ? selectedConversationId : "new-task"; }
+    private void stashDraft() {
+        if (prompt == null) return;
+        String value = prompt.getText().toString();
+        if (value.isEmpty()) drafts.remove(draftKey()); else drafts.put(draftKey(), value);
+    }
+    private void navigate(boolean history, String id) {
+        stashDraft();
+        showHistory = history; selectedConversationId = id;
+        visibleTurnLimit = 10;
+        prompt.setText(drafts.containsKey(draftKey()) ? drafts.get(draftKey()) : "");
+        renderHistory(true); refreshState();
+    }
+
+    private void openConversation(String id) {
+        hideKeyboard(); navigate(false, id);
+        contentScroll.smoothScrollTo(0, 0);
+    }
+
+    private void addTurn(JSONObject turn, int number) {
+        LinearLayout item = card();
+        TextView meta = text("对话 " + number + "  ·  " + date(turn.optLong("started_at")) + "  ·  " + stateLabel(turn.optString("state")), 12, MUTED);
+        item.addView(meta);
+        TextView request = text(turn.optString("prompt", "旧版任务"), 16, INK);
+        request.setTypeface(Typeface.DEFAULT_BOLD); request.setTextIsSelectable(true);
+        request.setPadding(0, dp(10), 0, dp(12)); item.addView(request);
+        String result = turn.optString("result");
+        if (!result.isEmpty()) {
+            TextView label = text("最终结果", 13, GREEN); label.setTypeface(Typeface.DEFAULT_BOLD); item.addView(label);
+            MarkdownView rich = new MarkdownView(this); rich.setMarkdown(result);
+            rich.setPadding(0, dp(8), 0, dp(6)); item.addView(rich);
+            Button copy = button("复制结果", false);
+            copy.setOnClickListener(view -> {
+                ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                clipboard.setPrimaryClip(ClipData.newPlainText("任务结果", result)); toast("已复制 Markdown 结果");
+            });
+            item.addView(copy, new LinearLayout.LayoutParams(-1, dp(40)));
+        } else {
+            TextView pending = text("running".equals(turn.optString("state"))
+                    ? "月薪喵正在处理，完成后结果会显示在这里。" : "这轮没有生成最终结果，可查看执行过程与结束原因。", 14, MUTED);
+            pending.setPadding(0, dp(4), 0, dp(10)); item.addView(pending);
+        }
+        String process = turn.optString("process");
+        final String turnId = turn.optString("id", selectedConversationId + "-" + number);
+        boolean expanded = expandedProcesses.contains(turnId);
+        Button processButton = button((expanded ? "收起执行过程  ∧" : "展开执行过程  ∨"), false);
+        processButton.setContentDescription(expanded ? "收起执行过程" : "展开执行过程");
+        LinearLayout.LayoutParams processSize = new LinearLayout.LayoutParams(-1, dp(42)); processSize.topMargin = dp(10);
+        item.addView(processButton, processSize);
+        processButton.setOnClickListener(view -> {
+            if (!expandedProcesses.add(turnId)) expandedProcesses.remove(turnId);
+            renderHistory(true);
+        });
+        if (expanded) {
+            TextView steps = text(process.isEmpty() ? "暂无可显示的执行过程。" : process, 13, MUTED);
+            steps.setTextIsSelectable(true); steps.setLineSpacing(dp(3), 1);
+            steps.setPadding(0, dp(10), 0, dp(8)); item.addView(steps);
+        }
+        String terminal = turn.optString("terminal");
+        if (!terminal.isEmpty()) {
+            TextView footer = text(terminal.replace("【任务结束】\n", ""), 12, MUTED);
+            footer.setTextIsSelectable(true); footer.setPadding(0, dp(12), 0, 0); item.addView(footer);
+        } else if ("running".equals(turn.optString("state"))) {
+            TextView status = text(turn.optString("status", "任务进行中…"), 12, GREEN);
+            status.setPadding(0, dp(12), 0, 0); item.addView(status);
+        }
+        historyPanel.addView(item, spaced());
+    }
+
+    private String date(long time) {
+        return time <= 0 ? "历史记录" : new SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(new Date(time));
+    }
+    private String stateLabel(String value) {
+        switch (value) {
+            case "running": return "进行中";
+            case "success": return "已完成";
+            case "stopped": return "已停止";
+            case "interrupted": return "已中断";
+            case "error": return "未完成";
+            default: return "历史任务";
+        }
     }
 
     private void saveSettings() {

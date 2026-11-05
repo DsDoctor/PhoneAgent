@@ -121,9 +121,39 @@ public final class LinuxRuntime {
 
     public Process startClaude(String prompt, String baseUrl, String model, String apiKey,
                                int bridgePort, String bridgeToken) throws Exception {
+        return startClaude(prompt, baseUrl, model, apiKey, bridgePort, bridgeToken, "");
+    }
+
+    public static boolean isSessionId(String value) {
+        return value != null && value.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+    }
+
+    /** Claude stores its real conversation JSONL below the persistent, bound Linux home. */
+    public boolean hasClaudeSession(String sessionId) {
+        if (!isSessionId(sessionId)) return false;
+        File projects = new File(home, ".claude/projects");
+        File[] directories = projects.listFiles();
+        if (directories == null) return false;
+        try {
+            String boundary = projects.getCanonicalPath() + File.separator;
+            for (File directory : directories) {
+                File session = new File(directory, sessionId.toLowerCase(Locale.US) + ".jsonl");
+                if (session.isFile() && session.length() > 0 && session.getCanonicalPath().startsWith(boundary)) return true;
+            }
+        } catch (IOException unavailable) { return false; }
+        return false;
+    }
+
+    public static final class MissingSessionException extends IOException {
+        MissingSessionException() { super("原会话文件已丢失，无法继续；请新建任务。"); }
+    }
+
+    public Process startClaude(String prompt, String baseUrl, String model, String apiKey,
+                               int bridgePort, String bridgeToken, String sessionId) throws Exception {
         final long operation = cancellationEpoch.get();
         if (!isInstalled()) throw new IOException("请先准备运行环境");
         if (apiKey == null || apiKey.trim().isEmpty()) throw new IOException("请先填写模型 API Key");
+        if (sessionId != null && !sessionId.isEmpty() && !hasClaudeSession(sessionId)) throw new MissingSessionException();
         updateBridge();
         updateDns();
         List<String> args = new ArrayList<>(Arrays.asList(
@@ -134,6 +164,7 @@ public final class LinuxRuntime {
                 "--mcp-config", "/opt/phoneagent/mcp.json",
                 "--append-system-prompt",
                 "你是用户手机上的简洁助手。请用中文回答，按用户要求通过 phone MCP 工具操作手机。"
+                + "每次收到新的用户指令，包括继续旧会话时，都先重新读取当前手机界面；上次的界面可能已经变化，不能沿用旧观察直接操作。"
                 + "先观察界面，再执行动作，再读取界面确认实际结果。不要把工具请求成功说成任务完成。"
                 + "任务开始先用 list_routines 查看可复用脚本和已验证操作；有合适脚本优先 run_routine。"
                 + "打开应用优先用 open_app_ready，它在本地等待加载并返回最终 screen；直接利用这个界面继续决策，不必机械地再读一次。"
@@ -144,6 +175,9 @@ public final class LinuxRuntime {
                 + "优先完成用户目标，再整理已验证脚本，并简要告诉用户新增或复用了什么。"
                 + "完成、遇到无法继续的实际阻碍或用户要求停止时，给出明确的最终答复，说明实际完成的内容和未完成的部分。"
                 + "只有这些手机工具可用；不能执行电脑或终端操作。遇到权限或锁屏限制请直接说明。"));
+        if (sessionId != null && !sessionId.isEmpty()) {
+            args.add("--resume"); args.add(sessionId.toLowerCase(Locale.US));
+        }
         if (model != null && !model.trim().isEmpty()) {
             args.add("--model"); args.add(model.trim());
         }

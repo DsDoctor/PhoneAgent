@@ -8,15 +8,25 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ResolveInfo;
 import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.text.Spanned;
+import android.text.style.ClickableSpan;
+import android.text.style.StyleSpan;
+import android.text.style.TypefaceSpan;
+import android.text.style.StrikethroughSpan;
+import android.text.style.URLSpan;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.ScrollView;
+import android.widget.EditText;
+import android.widget.HorizontalScrollView;
+import android.widget.TableLayout;
 import android.widget.TextView;
 import org.json.JSONObject;
 import org.json.JSONArray;
@@ -97,6 +107,9 @@ public final class TestInstrumentation extends Instrumentation {
             else if ("routines".equals(mode)) routines();
             else if ("longtask".equals(mode)) longTask();
             else if ("taskstore".equals(mode)) taskStore();
+            else if ("history".equals(mode)) history();
+            else if ("resume".equals(mode)) resume();
+            else if ("markdown".equals(mode)) markdown();
             else throw new AssertionError("Unknown test mode: " + mode);
             log("PASS " + mode);
             result.putString("stream", "\n" + report);
@@ -836,6 +849,479 @@ public final class TestInstrumentation extends Instrumentation {
         log("Only the isolated task-store cache directory was removed");
     }
 
+    /** Exercise retention, migration and interrupted recovery in cache-only history stores. */
+    private void history() throws Exception {
+        File directory = new File(getTargetContext().getCacheDir(), "history-smoke-" + UUID.randomUUID());
+        check(!directory.exists(), "Unique history test directory already exists");
+        try {
+            long now = System.currentTimeMillis();
+            File retentionDirectory = new File(directory, "retention");
+            TaskHistoryStore retention = new TaskHistoryStore(retentionDirectory);
+            retention.initialize(null);
+            List<String> identities = new ArrayList<>();
+            for (int i = 0; i < 25; i++) {
+                String id = UUID.randomUUID().toString();
+                identities.add(id);
+                JSONObject turn = syntheticTurn("success", "历史测试 " + i, "过程 " + i,
+                        "结果 " + i, now - 30000 + i * 1000L);
+                retention.importConversation(new JSONObject().put("id", id).put("title", "历史测试 " + i)
+                        .put("created_at", now - 30000 + i * 1000L).put("updated_at", now - 30000 + i * 1000L)
+                        .put("turns", new JSONArray().put(turn)));
+            }
+            JSONArray summaries = new TaskHistoryStore(retentionDirectory).summaries();
+            check(summaries.length() == 20, "History did not retain exactly the most recent 20 conversations");
+            for (int i = 0; i < 20; i++)
+                check(identities.get(24 - i).equals(summaries.getJSONObject(i).getString("id")),
+                        "History retention/order mismatch at " + i);
+            for (int i = 0; i < 5; i++)
+                check(retention.getConversation(identities.get(i)) == null, "Evicted oldest conversation remains available");
+            log("Recent 20 conversation limit and newest-first reconstruction verified");
+
+            File turnsDirectory = new File(directory, "turns");
+            TaskHistoryStore turns = new TaskHistoryStore(turnsDirectory);
+            turns.initialize(null);
+            JSONObject first = turns.beginTurn(null, "第一轮本地测试指令");
+            String conversationId = first.getString("conversation_id");
+            String sessionId = UUID.randomUUID().toString();
+            turns.bindSession(conversationId, sessionId);
+            JSONObject firstTurn = turns.getConversation(conversationId).getJSONArray("turns").getJSONObject(0);
+            firstTurn.put("state", "success").put("process", "中间过程标记")
+                    .put("result", "# 最终结果标记").put("terminal", "【任务结束】\n状态：完成")
+                    .put("output", "中间过程标记\n# 最终结果标记\n【任务结束】\n状态：完成")
+                    .put("reason", "success").put("ended_at", now).put("updated_at", now)
+                    .put("api_key", "fixture-field-must-not-persist").put("base_url", "http://fixture.invalid");
+            turns.updateTurn(conversationId, first.getString("turn_id"), firstTurn);
+            JSONObject second = turns.beginTurn(conversationId, "继续第一轮本地测试指令");
+            check(conversationId.equals(second.getString("conversation_id")) && sessionId.equals(second.getString("session_id")),
+                    "Continuation changed conversation/session identity");
+            check(!first.getString("turn_id").equals(second.getString("turn_id")), "Continuation reused a prior turn ID");
+            TaskHistoryStore reconstructed = new TaskHistoryStore(turnsDirectory);
+            JSONArray savedTurns = reconstructed.getConversation(conversationId).getJSONArray("turns");
+            check(savedTurns.length() == 2 && "第一轮本地测试指令".equals(savedTurns.getJSONObject(0).optString("prompt"))
+                            && "继续第一轮本地测试指令".equals(savedTurns.getJSONObject(1).optString("prompt")),
+                    "Reconstruction lost separate prompts or turns");
+            JSONObject savedFirst = savedTurns.getJSONObject(0);
+            check("中间过程标记".equals(savedFirst.getString("process"))
+                            && "# 最终结果标记".equals(savedFirst.getString("result"))
+                            && savedFirst.getString("terminal").contains("【任务结束】"),
+                    "Reconstruction merged process/result/terminal fields");
+            check(!savedFirst.has("api_key") && !savedFirst.has("base_url"), "History persisted configuration fields");
+            JSONObject detached = reconstructed.getConversation(conversationId);
+            detached.put("title", "must-not-mutate-store");
+            check(!"must-not-mutate-store".equals(reconstructed.getConversation(conversationId).optString("title")),
+                    "History returns mutable internal conversation state");
+            reconstructed.initialize(null);
+            JSONObject recoveredTurn = reconstructed.getConversation(conversationId).getJSONArray("turns").getJSONObject(1);
+            check("interrupted".equals(recoveredTurn.optString("state"))
+                            && "process_interrupted".equals(recoveredTurn.optString("reason"))
+                            && recoveredTurn.optLong("ended_at") > 0 && recoveredTurn.optString("result").isEmpty()
+                            && recoveredTurn.optString("terminal").contains("【任务结束】"),
+                    "Running history turn was not recovered as interrupted with a separate terminal record");
+            String recoveredSnapshot = reconstructed.getConversation(conversationId).toString();
+            TaskHistoryStore recoveredAgain = new TaskHistoryStore(turnsDirectory);
+            recoveredAgain.initialize(null);
+            check(recoveredSnapshot.equals(recoveredAgain.getConversation(conversationId).toString()),
+                    "Repeated initialization modified the recovered conversation");
+            check(savedFirst.toString().equals(recoveredAgain.getConversation(conversationId).getJSONArray("turns").getJSONObject(0).toString()),
+                    "Recovering the latest running turn changed an earlier completed turn");
+            log("Separate prompts, results and process; continuation identity; idempotent running-turn recovery verified");
+
+            File legacyDirectory = new File(directory, "legacy");
+            LastTaskStore legacy = new LastTaskStore(legacyDirectory);
+            String legacyOutput = "旧版本保留的完整输出\n第二行\n\n【任务结束】\n状态：完成\n原因：success";
+            legacy.write(new JSONObject().put("version", 1).put("state", "success").put("status", "旧任务完成")
+                    .put("output", legacyOutput).put("reason", "success").put("acknowledged", true)
+                    .put("started_at", now - 2000).put("updated_at", now - 1000).put("ended_at", now - 1000));
+            String legacyBefore = legacy.read().toString();
+            TaskHistoryStore migrated = new TaskHistoryStore(legacyDirectory);
+            migrated.initialize(legacy.read());
+            JSONArray migratedSummaries = migrated.summaries();
+            check(migratedSummaries.length() == 1, "Legacy last-task did not become one conversation");
+            JSONObject migratedSummary = migratedSummaries.getJSONObject(0);
+            check(migratedSummary.optBoolean("legacy") && migratedSummary.optString("session_id").isEmpty()
+                            && !migratedSummary.optBoolean("can_continue"), "Legacy migration invented a resumable CLI session");
+            JSONObject migratedTurn = migrated.getConversation(migratedSummary.getString("id")).getJSONArray("turns").getJSONObject(0);
+            check(legacyOutput.equals(migratedTurn.optString("output")), "Legacy migration lost the original transcript");
+            check(migratedTurn.optString("process").contains("旧版本保留的完整输出\n第二行")
+                            && migratedTurn.optString("terminal").contains("【任务结束】"), "Legacy migration lost process/footer text");
+            check(legacyBefore.equals(new LastTaskStore(legacyDirectory).read().toString()), "History migration modified legacy last-task data");
+            TaskHistoryStore migratedAgain = new TaskHistoryStore(legacyDirectory);
+            migratedAgain.initialize(legacy.read());
+            check(migratedAgain.summaries().length() == 1, "Legacy initialization duplicated the old conversation");
+            log("Legacy last-task migrated once without lost text, altered source or invented session");
+
+            Context isolated = isolatedFilesContext(turnsDirectory);
+            AgentController restored = constructIsolatedController(isolated);
+            check(!restored.isRunning(), "Reconstructed history Controller revived a running process");
+            JSONObject restoredConversation = restored.getConversation(conversationId);
+            check(restoredConversation != null && restoredConversation.getJSONArray("turns").length() == 2,
+                    "Controller reconstruction did not expose persisted history");
+
+            File handoffDirectory = new File(directory, "interrupted-followup");
+            TaskHistoryStore handoff = new TaskHistoryStore(handoffDirectory);
+            handoff.initialize(null);
+            JSONObject oldStarted = handoff.beginTurn(null, "断点前第一轮");
+            String handoffId = oldStarted.getString("conversation_id");
+            JSONObject oldTurn = syntheticTurn("success", "断点前第一轮", "旧过程", "旧成功结果", now - 1000)
+                    .put("id", oldStarted.getString("turn_id"));
+            handoff.updateTurn(handoffId, oldStarted.getString("turn_id"), oldTurn);
+            JSONObject oldLastTask = new JSONObject(oldTurn.toString()).put("version", 1)
+                    .put("conversation_id", handoffId).put("turn_id", oldStarted.getString("turn_id"));
+            new LastTaskStore(handoffDirectory).write(oldLastTask);
+            JSONObject newStarted = handoff.beginTurn(handoffId, "已落盘但尚未更新last-task的追问");
+            JSONObject runningFollowup = handoff.getConversation(handoffId).getJSONArray("turns").getJSONObject(1)
+                    .put("process", "新追问已启动").put("output", "新追问已启动");
+            handoff.updateTurn(handoffId, newStarted.getString("turn_id"), runningFollowup);
+            AgentController handoffRestored = constructIsolatedController(isolatedFilesContext(handoffDirectory));
+            check(!handoffRestored.isRunning() && handoffRestored.getVisualState() == AgentController.VisualState.ERROR,
+                    "Old successful last-task hid an interrupted new turn in the same conversation");
+            JSONArray handoffTurns = handoffRestored.getConversation(handoffId).getJSONArray("turns");
+            check(handoffTurns.length() == 2 && "success".equals(handoffTurns.getJSONObject(0).optString("state"))
+                            && "interrupted".equals(handoffTurns.getJSONObject(1).optString("state"))
+                            && "process_interrupted".equals(handoffTurns.getJSONObject(1).optString("reason")),
+                    "Same-conversation crash recovery lost the old result or did not interrupt the new turn");
+            check(controllerOutput(handoffRestored).contains("新追问已启动")
+                            && controllerOutput(handoffRestored).contains("【任务结束】")
+                            && !controllerOutput(handoffRestored).contains("旧成功结果"),
+                    "Controller replayed the stale old success instead of the interrupted followup");
+            log("Crash between new same-conversation turn and last-task update restores interrupted followup, preserving old success");
+        } finally {
+            deleteTestTree(directory);
+        }
+        log("Only isolated history cache directories were removed; no model or user history was used");
+    }
+
+    private JSONObject syntheticTurn(String state, String prompt, String process, String result, long time) throws Exception {
+        String terminal = "【任务结束】\n状态：完成\n原因：success";
+        return new JSONObject().put("id", UUID.randomUUID().toString()).put("state", state).put("prompt", prompt)
+                .put("process", process).put("result", result).put("terminal", terminal)
+                .put("output", process + "\n" + result + "\n" + terminal).put("status", "本地测试已完成")
+                .put("reason", "success").put("started_at", time - 1).put("updated_at", time).put("ended_at", time);
+    }
+
+    private Context isolatedFilesContext(File directory) {
+        return new ContextWrapper(getTargetContext()) {
+            @Override public File getFilesDir() { return directory; }
+            @Override public Context getApplicationContext() { return this; }
+        };
+    }
+
+    /** Three real CLI invocations: A, B, then --resume A after rebuilding Controller. */
+    private void resume() throws Exception {
+        long serviceDeadline = SystemClock.uptimeMillis() + 15000;
+        while (!PhoneAccessibilityService.isEnabled() && SystemClock.uptimeMillis() < serviceDeadline)
+            SystemClock.sleep(200);
+        check(PhoneAccessibilityService.isEnabled(), "Enable accessibility before resume test");
+        AgentController userController = AgentController.get(getTargetContext());
+        check(!userController.isRunning(), "Do not test resume while a user task is running");
+        LinuxRuntime runtime = new LinuxRuntime(getTargetContext());
+        check(runtime.isInstalled(), "Run mode=runtime before mode=resume");
+        File directory = new File(getTargetContext().getCacheDir(), "resume-smoke-" + UUID.randomUUID());
+        check(!directory.exists(), "Unique resume test directory already exists");
+        Context isolated = isolatedFilesContext(directory);
+        String identityA = UUID.randomUUID().toString().replace("-", "");
+        String identityB = UUID.randomUUID().toString().replace("-", "");
+        List<String> changedModelKeys = new CopyOnWriteArrayList<>();
+        SharedPreferences settings = getTargetContext().getSharedPreferences("phoneagent", Context.MODE_PRIVATE);
+        SharedPreferences.OnSharedPreferenceChangeListener observer = (preferences, key) -> {
+            if (key == null || key.equals("base_url") || key.equals("model") || key.equals("key_ciphertext") || key.equals("key_iv"))
+                changedModelKeys.add(key == null ? "<clear>" : key);
+        };
+        settings.registerOnSharedPreferenceChangeListener(observer);
+        AgentController firstController = new AgentController(isolated, runtime);
+        AgentController secondController = null;
+        try {
+            log("LOCAL SESSION FIXTURE: original user/assistant context and conversation isolation are checked by the server");
+            ControllerProbe firstProbe = runSessionTurn(firstController, null, "PHONEAGENT_SESSION_START_" + identityA,
+                    "SESSION_FIRST_" + identityA);
+            String conversationA = firstController.getActiveConversationId();
+            JSONObject firstConversation = firstController.getConversation(conversationA);
+            String sessionA = firstConversation.getString("session_id");
+            check(LinuxRuntime.isSessionId(sessionA) && runtime.hasClaudeSession(sessionA),
+                    "First task did not bind a real persisted Claude CLI session");
+            JSONArray firstTurns = firstConversation.getJSONArray("turns");
+            check(firstTurns.length() == 1, "First task did not create exactly one turn");
+            assertSeparatedSessionTurn(firstTurns.getJSONObject(0), identityA, false);
+            check(firstProbe.historyCallbacks.get() > 0, "First turn never notified history listeners");
+            String originalFirstTurn = firstTurns.getJSONObject(0).toString();
+            log("First fixture conversation created a real CLI session: " + sessionA);
+
+            runSessionTurn(firstController, null, "PHONEAGENT_SESSION_START_" + identityB,
+                    "SESSION_FIRST_" + identityB);
+            String conversationB = firstController.getActiveConversationId();
+            JSONObject secondConversation = firstController.getConversation(conversationB);
+            String sessionB = secondConversation.getString("session_id");
+            check(!conversationA.equals(conversationB) && !sessionA.equals(sessionB)
+                            && LinuxRuntime.isSessionId(sessionB) && runtime.hasClaudeSession(sessionB),
+                    "Independent task reused the first conversation or CLI session");
+            assertSeparatedSessionTurn(secondConversation.getJSONArray("turns").getJSONObject(0), identityB, false);
+            String untouchedB = secondConversation.toString();
+            check(firstController.getConversations().length() == 2, "Independent tasks did not create two conversations");
+            log("Second fixture conversation created its own CLI session: " + sessionB);
+
+            secondController = new AgentController(isolated, runtime);
+            check(!secondController.isRunning() && secondController.getConversations().length() == 2,
+                    "Controller reconstruction lost conversations or revived a task");
+            ControllerProbe resumedProbe = runSessionTurn(secondController, conversationA,
+                    "PHONEAGENT_SESSION_CONTINUE_" + identityA, "SESSION_SECOND_" + identityA);
+            JSONObject resumedConversation = secondController.getConversation(conversationA);
+            JSONArray resumedTurns = resumedConversation.getJSONArray("turns");
+            check(sessionA.equals(resumedConversation.getString("session_id")), "Continuation changed the Claude CLI session ID");
+            check(resumedTurns.length() == 2, "Continuation did not append exactly one turn to the selected conversation");
+            check(originalFirstTurn.equals(resumedTurns.getJSONObject(0).toString()), "Continuation rewrote its first completed turn");
+            check(!resumedTurns.getJSONObject(0).getString("id").equals(resumedTurns.getJSONObject(1).getString("id")),
+                    "Continuation reused the first turn ID");
+            assertSeparatedSessionTurn(resumedTurns.getJSONObject(1), identityA, true);
+            check(untouchedB.equals(secondController.getConversation(conversationB).toString()),
+                    "Resuming A modified independent conversation B");
+            check(secondController.getConversations().length() == 2
+                            && conversationA.equals(secondController.getConversations().getJSONObject(0).getString("id")),
+                    "Resumed conversation was duplicated or not moved to the top of history");
+            check(resumedProbe.historyCallbacks.get() > 0 && resumedProbe.states.contains(AgentController.VisualState.ACTING),
+                    "Continuation lacked history updates or a fresh phone-tool execution");
+            TaskHistoryStore persisted = new TaskHistoryStore(directory);
+            JSONObject persistedExpected = new JSONObject(resumedConversation.toString());
+            persistedExpected.remove("can_continue"); persistedExpected.remove("continue_unavailable_reason");
+            check(persistedExpected.toString().equals(persisted.getConversation(conversationA).toString()),
+                    "Continued conversation did not survive store reconstruction");
+            check(changedModelKeys.isEmpty(), "Resume changed user model configuration keys: " + changedModelKeys);
+            log("Real CLI resumed A after B and Controller reconstruction; fixture proved original user + assistant context, fresh read and no cross-session content");
+            assertConversationUi(secondController, conversationA, conversationB, identityA, identityB);
+        } finally {
+            AgentController finalSecond = secondController;
+            runOnMainSync(() -> {
+                firstController.stop();
+                if (finalSecond != null) finalSecond.stop();
+                OverlayService.setPetState(userController.getVisualState());
+            });
+            settings.unregisterOnSharedPreferenceChangeListener(observer);
+            shutdownTestController(firstController);
+            if (secondController != null) shutdownTestController(secondController);
+            deleteTestTree(directory);
+        }
+        log("Android user history and model settings were untouched; fixture CLI session IDs above identify the two new Linux session files");
+    }
+
+    private ControllerProbe runSessionTurn(AgentController controller, String conversationId,
+                                           String prompt, String resultMarker) throws Exception {
+        ControllerProbe probe = new ControllerProbe();
+        try {
+            runOnMainSync(() -> {
+                controller.setListener(probe);
+                if (conversationId == null) controller.run(prompt, "http://127.0.0.1:18080", "phoneagent-smoke-session", "local-test-only");
+                else controller.runInConversation(conversationId, prompt, "http://127.0.0.1:18080", "phoneagent-smoke-session", "local-test-only");
+            });
+            check(probe.finished.await(120, TimeUnit.SECONDS), "Session fixture task timed out: " + probe.status.get());
+            check(probe.success.get() && !controller.isRunning(), "Session fixture task failed: " + probe.message.get() + "\n" + probe.output.get());
+            check(probe.output.get().contains(resultMarker), "Session fixture did not reach its validated final response");
+            check(controller.getVisualState() == AgentController.VisualState.SUCCESS, "Session task did not finish in SUCCESS");
+            return probe;
+        } finally {
+            runOnMainSync(() -> controller.removeListener(probe));
+        }
+    }
+
+    private void assertSeparatedSessionTurn(JSONObject turn, String identity, boolean resumed) throws Exception {
+        String processMarker = "PROCESS_ONLY_" + identity + (resumed ? "_followup" : "_initial");
+        String resultMarker = (resumed ? "SESSION_SECOND_" : "SESSION_FIRST_") + identity;
+        String process = turn.getString("process"), result = turn.getString("result"), terminal = turn.getString("terminal");
+        check("success".equals(turn.optString("state")), "Persisted fixture turn did not succeed");
+        check(process.contains(processMarker), "Intermediate assistant text was not saved in process");
+        check(result.contains(resultMarker) && result.contains("# 本地会话验证") && result.contains("**") && result.contains("```"),
+                "Structured CLI final result or its Markdown was lost");
+        check(!result.contains("PROCESS_ONLY_") && !result.contains("【任务结束】"),
+                "Final result contains intermediate process or local terminal text");
+        check(!process.contains(resultMarker), "Final assistant response was duplicated into the process section");
+        check(terminal.contains("【任务结束】") && !terminal.contains(resultMarker) && !terminal.contains("PROCESS_ONLY_"),
+                "Terminal record is not separate from model content");
+    }
+
+    private void shutdownTestController(AgentController controller) throws Exception {
+        Field field = AgentController.class.getDeclaredField("worker");
+        field.setAccessible(true);
+        java.util.concurrent.ExecutorService worker = (java.util.concurrent.ExecutorService) field.get(controller);
+        worker.shutdown();
+        check(worker.awaitTermination(15, TimeUnit.SECONDS), "Isolated Controller worker did not finish during cleanup");
+    }
+
+    /** Temporarily render isolated history through the real Activity; never send a UI prompt. */
+    private void assertConversationUi(AgentController isolatedController, String conversationA, String conversationB,
+                                      String identityA, String identityB) throws Exception {
+        waitForMainActivityVisible();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            MainActivity activity = resumedMain;
+            Field controllerField = null, selectedField = null, historyField = null, expandedField = null;
+            Method render = null, refresh = null;
+            AgentController previousController = null;
+            String previousSelection = null, previousDraft = null;
+            boolean previousHistory = true;
+            Set<String> previousExpanded = null;
+            EditText prompt = null;
+            ScrollView scroll = null;
+            int previousScroll = 0;
+            try {
+                controllerField = accessibleField(MainActivity.class, "controller");
+                selectedField = accessibleField(MainActivity.class, "selectedConversationId");
+                historyField = accessibleField(MainActivity.class, "showHistory");
+                expandedField = accessibleField(MainActivity.class, "expandedProcesses");
+                previousController = (AgentController) controllerField.get(activity);
+                previousSelection = (String) selectedField.get(activity);
+                previousHistory = historyField.getBoolean(activity);
+                @SuppressWarnings("unchecked") Set<String> expanded = (Set<String>) expandedField.get(activity);
+                previousExpanded = new HashSet<>(expanded);
+                prompt = (EditText) accessibleField(MainActivity.class, "prompt").get(activity);
+                previousDraft = prompt.getText().toString();
+                scroll = (ScrollView) accessibleField(MainActivity.class, "contentScroll").get(activity);
+                previousScroll = scroll.getScrollY();
+                render = MainActivity.class.getDeclaredMethod("renderHistory", boolean.class); render.setAccessible(true);
+                refresh = MainActivity.class.getDeclaredMethod("refreshState"); refresh.setAccessible(true);
+                Method open = MainActivity.class.getDeclaredMethod("openConversation", String.class); open.setAccessible(true);
+                controllerField.set(activity, isolatedController);
+                selectedField.set(activity, ""); historyField.setBoolean(activity, true); expanded.clear();
+                render.invoke(activity, true);
+                View historyPanel = (View) accessibleField(MainActivity.class, "historyPanel").get(activity);
+                String listText = renderedText(historyPanel);
+                check(listText.contains("PHONEAGENT_SESSION_START_" + identityA)
+                                && listText.contains("PHONEAGENT_SESSION_START_" + identityB),
+                        "Real Activity history list did not render both isolated conversations");
+                open.invoke(activity, conversationA);
+                check(collectViews(historyPanel, MarkdownView.class).size() == 2, "A detail did not render two native Markdown results");
+                String detailA = renderedText(historyPanel);
+                check(detailA.contains("SESSION_FIRST_" + identityA) && detailA.contains("SESSION_SECOND_" + identityA)
+                                && !detailA.contains("SESSION_FIRST_" + identityB), "A detail lost turns or included B content");
+                check(!detailA.contains("PROCESS_ONLY_"), "Execution process was expanded by default");
+                List<TextView> textViews = collectViews(historyPanel, TextView.class);
+                List<TextView> expandButtons = new ArrayList<>();
+                for (TextView view : textViews) if ("展开执行过程".contentEquals(view.getContentDescription() == null ? "" : view.getContentDescription()))
+                    expandButtons.add(view);
+                check(expandButtons.size() == 2, "A detail did not expose two collapsed process controls");
+                check(expandButtons.get(0).performClick(), "Process control could not be clicked");
+                check(renderedText(historyPanel).contains("PROCESS_ONLY_" + identityA + "_initial"),
+                        "Expanding process did not show the first turn's intermediate text");
+                TextView send = (TextView) accessibleField(MainActivity.class, "send").get(activity);
+                check("继续对话".contentEquals(send.getText()) && send.isEnabled(), "A detail did not expose enabled Continue action");
+                open.invoke(activity, conversationB);
+                check(collectViews(historyPanel, MarkdownView.class).size() == 1, "B detail did not render its one native Markdown result");
+                String detailB = renderedText(historyPanel);
+                check(detailB.contains("SESSION_FIRST_" + identityB) && !detailB.contains("SESSION_FIRST_" + identityA)
+                                && !detailB.contains("SESSION_SECOND_" + identityA), "Switching detail mixed conversation content");
+            } catch (Throwable error) { failure.set(error); }
+            finally {
+                try {
+                    if (previousController != null) controllerField.set(activity, previousController);
+                    if (previousSelection != null) selectedField.set(activity, previousSelection);
+                    if (historyField != null) historyField.setBoolean(activity, previousHistory);
+                    if (previousExpanded != null) {
+                        @SuppressWarnings("unchecked") Set<String> expanded = (Set<String>) expandedField.get(activity);
+                        expanded.clear(); expanded.addAll(previousExpanded);
+                    }
+                    if (render != null) render.invoke(activity, true);
+                    if (refresh != null) refresh.invoke(activity);
+                    if (prompt != null && previousDraft != null) prompt.setText(previousDraft);
+                    if (scroll != null) scroll.scrollTo(0, previousScroll);
+                } catch (Throwable cleanup) { if (failure.get() == null) failure.set(cleanup); }
+            }
+        });
+        if (failure.get() != null) throw new AssertionError("Isolated real-Activity history rendering failed", failure.get());
+        log("Real Activity lists separate conversations, renders multiple Markdown results, collapses process and routes Continue; user view/draft restored");
+    }
+
+    private static Field accessibleField(Class<?> type, String name) throws Exception {
+        Field field = type.getDeclaredField(name); field.setAccessible(true); return field;
+    }
+
+    private static <T extends View> List<T> collectViews(View root, Class<T> type) {
+        List<T> result = new ArrayList<>();
+        if (type.isInstance(root)) result.add(type.cast(root));
+        if (root instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) root;
+            for (int i = 0; i < group.getChildCount(); i++) result.addAll(collectViews(group.getChildAt(i), type));
+        }
+        return result;
+    }
+
+    private static String renderedText(View root) {
+        StringBuilder result = new StringBuilder();
+        for (TextView view : collectViews(root, TextView.class)) result.append(view.getText()).append('\n');
+        return result.toString();
+    }
+
+    /** Native Markdown presentation and inert unsafe destinations; no link is clicked. */
+    private void markdown() throws Exception {
+        String source = "# 一级标题\n\n## 二级标题\n\n普通段落 **加粗**、*斜体*、~~删除~~ 和 `行内代码`。\n\n"
+                + "- 无序条目\n1. 有序条目\n\n> 引用内容\n\n```text\n**代码保留符号**\n第二行\n```\n\n"
+                + "| 名称 | 状态 |\n| --- | --- |\n| 月薪喵 | 可用 |\n\n"
+                + "[安全项目](https://github.com/DsDoctor/PhoneAgent) "
+                + "[脚本](javascript:alert(1)) [文件](file:///data/local/tmp/test) "
+                + "[意图](intent://example/#Intent;end) [内嵌](data:text/html,test) "
+                + "[相对](/local) [凭据](https://user:password@example.com/)";
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try {
+                MarkdownView view = new MarkdownView(getTargetContext());
+                view.setMarkdown(source);
+                List<TextView> texts = collectViews(view, TextView.class);
+                String rendered = renderedText(view);
+                check(rendered.contains("一级标题") && rendered.contains("二级标题") && rendered.contains("引用内容")
+                                && rendered.contains("无序条目") && rendered.contains("有序条目") && rendered.contains("月薪喵"),
+                        "Markdown lost heading/list/quote/table content");
+                boolean heading = false, bold = false, italic = false, strike = false, inlineCode = false, fencedCode = false;
+                int linkCount = 0, clickableCount = 0;
+                for (TextView text : texts) {
+                    CharSequence content = text.getText();
+                    if ("一级标题".contentEquals(content)) {
+                        heading = text.getTypeface() != null && text.getTypeface().isBold() && text.getTextSize() > 15 * getTargetContext().getResources().getDisplayMetrics().scaledDensity;
+                    }
+                    if (content.toString().contains("**代码保留符号**")) {
+                        fencedCode = Typeface.MONOSPACE.equals(text.getTypeface()) && text.getParent() instanceof HorizontalScrollView;
+                        if (content instanceof Spanned)
+                            check(((Spanned) content).getSpans(0, content.length(), StyleSpan.class).length == 0,
+                                    "Fenced code was interpreted as inline Markdown");
+                    }
+                    if (!(content instanceof Spanned)) continue;
+                    Spanned spanned = (Spanned) content;
+                    for (StyleSpan span : spanned.getSpans(0, content.length(), StyleSpan.class)) {
+                        String covered = content.subSequence(spanned.getSpanStart(span), spanned.getSpanEnd(span)).toString();
+                        if (span.getStyle() == Typeface.BOLD && "加粗".equals(covered)) bold = true;
+                        if (span.getStyle() == Typeface.ITALIC && "斜体".equals(covered)) italic = true;
+                    }
+                    for (StrikethroughSpan span : spanned.getSpans(0, content.length(), StrikethroughSpan.class))
+                        if ("删除".contentEquals(content.subSequence(spanned.getSpanStart(span), spanned.getSpanEnd(span)))) strike = true;
+                    for (TypefaceSpan span : spanned.getSpans(0, content.length(), TypefaceSpan.class))
+                        if ("monospace".equals(span.getFamily()) && "行内代码".contentEquals(content.subSequence(spanned.getSpanStart(span), spanned.getSpanEnd(span)))) inlineCode = true;
+                    for (URLSpan span : spanned.getSpans(0, content.length(), URLSpan.class)) {
+                        linkCount++;
+                        check("https://github.com/DsDoctor/PhoneAgent".equals(span.getURL()), "Unsafe destination became a URLSpan");
+                    }
+                    clickableCount += spanned.getSpans(0, content.length(), ClickableSpan.class).length;
+                }
+                check(heading && bold && italic && strike && inlineCode && fencedCode,
+                        "Native Markdown styles missing: heading=" + heading + ", bold=" + bold + ", italic=" + italic
+                                + ", strike=" + strike + ", inlineCode=" + inlineCode + ", fencedCode=" + fencedCode);
+                check(collectViews(view, TableLayout.class).size() == 1 && collectViews(view, HorizontalScrollView.class).size() >= 2,
+                        "Table/code did not use native horizontal scrolling containers");
+                check(linkCount == 1 && clickableCount == 1, "Markdown created unexpected clickable destinations");
+                for (String label : new String[]{"脚本", "文件", "意图", "内嵌", "相对", "凭据"})
+                    check(rendered.contains(label), "Blocked-link label was lost: " + label);
+                for (String url : new String[]{"javascript:alert(1)", "file:///data/local/tmp/test", "intent://example/#Intent;end",
+                        "data:text/html,test", "/relative", "//example.com/path", "https://user:password@example.com/",
+                        "https://example.com:65536/", "https://example.com\\path", "https://example.com/\npath", "https:///missing-host"})
+                    check(MarkdownView.safeWebUrl(url) == null, "Unsafe URL passed the native-link validator: " + url);
+                check(MarkdownView.safeWebUrl("http://example.com/path?q=1#part") != null
+                                && MarkdownView.safeWebUrl("https://example.com/path") != null, "Ordinary absolute web URLs were rejected");
+                View firstChild = view.getChildAt(0);
+                view.setMarkdown(source);
+                check(firstChild == view.getChildAt(0), "Identical Markdown unnecessarily rebuilt the view tree");
+                view.setMarkdown("新的结果 **已更新**");
+                check(renderedText(view).contains("新的结果 已更新") && !renderedText(view).contains("一级标题"),
+                        "Replacing Markdown retained stale previous result nodes");
+            } catch (Throwable error) { failure.set(error); }
+        });
+        if (failure.get() != null) throw new AssertionError("Native Markdown regression", failure.get());
+        log("Native headings, inline styles, lists, quote, fenced code, table and safe link spans verified; no link opened or resource fetched");
+    }
+
     private AgentController constructIsolatedController(Context context) throws Exception {
         Constructor<AgentController> constructor = AgentController.class.getDeclaredConstructor(Context.class);
         constructor.setAccessible(true);
@@ -1362,10 +1848,12 @@ public final class TestInstrumentation extends Instrumentation {
         final AtomicReference<String> output = new AtomicReference<>("");
         final AtomicReference<String> message = new AtomicReference<>("");
         final AtomicInteger finishedCallbacks = new AtomicInteger();
+        final AtomicInteger historyCallbacks = new AtomicInteger();
         final List<AgentController.VisualState> states = new CopyOnWriteArrayList<>();
         @Override public void onVisualState(AgentController.VisualState state) { states.add(state); }
         @Override public void onStatus(String value) { status.set(value); }
         @Override public void onOutput(String value) { output.set(value); }
+        @Override public void onHistoryChanged() { historyCallbacks.incrementAndGet(); }
         @Override public void onFinished(boolean ok, String value) {
             finishedCallbacks.incrementAndGet();
             success.set(ok);

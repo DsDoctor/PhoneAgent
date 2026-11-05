@@ -93,6 +93,38 @@ python3 scripts/test-device.py longtask
 python3 scripts/test-device.py taskstore
 ```
 
+## Conversation history and migration
+
+`history` uses unique cache directories, synthetic records and the actual `TaskHistoryStore`. It verifies the newest 20 of 25 conversations survive reconstruction in order, continuation appends a distinct turn while preserving the conversation/session identity, and prompt/process/result/terminal fields remain separate. A reconstructed running turn must become `interrupted` once without changing prior completed turns. It also models a crash after the same conversation's followup is saved but before `last-task.json` updates: Controller must show the interrupted followup, not the older successful turn. The legacy migration must preserve its complete transcript and original file, run once, and never invent a resumable CLI session. An isolated Controller reads the reconstructed history. No model, fixture server, real app history or user credentials are used.
+
+```bash
+python3 scripts/test-device.py history
+```
+
+## Real Claude session continuation
+
+Start the updated local fixture and reverse port 18080 as described above, then run:
+
+```bash
+python3 scripts/test-device.py resume
+```
+
+`resume` runs the real installed Claude Code three times through the actual Controller: conversation A's first task, independent conversation B, then continuation of A after rebuilding the Controller. All requests use `phoneagent-smoke-session` and the disposable local key. Each test generates separate random conversation markers. The fixture permits the continuation's final response only when its Anthropic `messages` contain **both the first user prompt and the first assistant final response in order**, with no markers from B. Each turn must execute a fresh `read_screen` with its own exact tool-use ID; old tool counts cannot satisfy the new turn. The runtime supplies the saved real CLI session through `--resume`.
+
+The test requires A's CLI session ID to remain unchanged, B's ID to differ, A to have two distinct turns without changing the first, B to remain unchanged, and the resumed conversation to move to the top of history. The fixture emits intermediate assistant prose followed by a Markdown final response; persisted `process`, `result` and `terminal` must remain separate, with no duplicated final prose in process. This is integration validation using fixed responses, not validation of an external model's reasoning.
+
+Android history and last-task files live in an isolated cache directory. The actual Linux home gains **two new fixture CLI session files**, whose UUIDs are reported; use a pre-test backup if an entirely pristine Linux home is required. The test does not change HOME or user model settings. It temporarily renders the isolated Controller in the real MainActivity to check the two-conversation list, two native Markdown results for A, default-collapsed and expandable process, enabled “继续对话”, and switching to B without stale A content. It never clicks the send button and restores the original Controller, selection, draft and expanded-process state. The isolated history directory is removed afterwards.
+
+Restart an already-running fixture server after modifying `tests/mock_anthropic.py`.
+
+## Native Markdown and safe links
+
+`markdown` constructs the actual `MarkdownView` on the UI thread and inspects its native children and spans. It checks heading hierarchy, bold/italic/strikethrough, inline monospace, lists, quotes, literal fenced code, a native table, horizontal code/table containers and an HTTPS URL span. Unsafe schemes, relative URLs, credentials in URLs, malformed ports, whitespace and backslashes must remain non-clickable; blocked-link labels stay readable. Replacing a result removes old nodes, while an identical result does not rebuild the tree. No link is clicked, remote resource loaded or model contacted.
+
+```bash
+python3 scripts/test-device.py markdown
+```
+
 ## Overlay and cat animation
 
 `overlay` verifies that the bubble is hidden inside MainActivity, attached using `TYPE_ACCESSIBILITY_OVERLAY` on Home and Settings, and returns to the app when tapped. It then invokes the real phone-control button listener and goes directly Home from accessibility settings, exercising the previous stale-visibility regression. The Settings bubble is tapped with a real accessibility gesture; the control-button listener is invoked on the UI thread to avoid unrelated return-animation hit testing. Attached/view visibility alone does not prove compositor visibility; inspect the actual Settings window or `dumpsys window` as well.

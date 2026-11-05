@@ -153,6 +153,10 @@ It waits for native `AskUserQuestion`, rejects answers from another conversation
 
 All test history, CLI session files, native memory, bridge files and temporary files live under one unique cache directory, which is removed afterwards. Only the installed rootfs is shared; this mode never calls runtime installation. User history, Linux HOME and model preferences are not written. The fixture's `/status` endpoint exposes only a request count and a delay-started flag to synchronize the pause test without guessing a sleep duration. No real model endpoint or key is used. This Controller test complements `scripts/probe-interaction.py`, whose separate isolated probe covers native file tools, native memory loading/writing, and raw transport protocol behavior.
 
+The interaction mode also makes one local request that receives HTTP 500, then succeeds on its retry. It requires a visible `RETRYING` phase, a saved HTTP 500 retry hint, and exactly one engine turn, one model reply and one retry. The interrupted/continued task must retain both query counts in its persisted metrics ledger. UI assertions distinguish cumulative counts from old final-segment counts.
+
+For only the native retry event contract, without instrumentation or accessibility changes, run `python3 scripts/probe-interaction.py --serial DEVICE_SERIAL --only-retry`. This creates a disposable HOME, captures the actual `system/api_retry` event without partial-message output, and requires exactly two local HTTP requests. It does not repeat the file, question or memory probes.
+
 ## Real Claude session continuation
 
 Start the updated local fixture and reverse port 18080 as described above, then run:

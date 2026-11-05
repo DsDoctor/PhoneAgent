@@ -107,10 +107,14 @@ class RegressionSafetyTests(unittest.TestCase):
             runner = self.runner(temp)
             for desc, text in [("开始执行", "开始执行"), ("继续对话", "继续对话"),
                                ("删除此任务", "删除"), ("重置为待命", "重置"),
-                               ("", "保存连接配置"), ("停止任务", "停止")]:
+                               ("", "保存连接配置"), ("停止任务", "停止"), ("结束任务", "结束"),
+                               ("任务输入", "结束")]:
                 with self.assertRaises(ui.Failure):
                     runner.tap(node(desc, text, "android.widget.Button"))
             runner.adb.shell.assert_not_called()
+            for desc in ("停止任务", "结束任务"):
+                with self.assertRaises(ui.Failure):
+                    runner.assert_idle_ui(ui.Ui([node(desc, "结束", "android.widget.Button")], "0"))
 
     def test_draft_ownership_accepts_only_complete_known_suffix(self):
         self.assertEqual(ui.draft_prefix("73112345", "73112345", "想让月薪喵做什么？"), "")

@@ -95,6 +95,7 @@ public final class OverlayService extends Service {
             case PAUSED: message = "任务已暂停 · 点此补充或继续"; break;
             case WAITING_USER: message = "月薪喵在等你回答 · 点此查看问题"; break;
             case RESUMING: message = "正在继续任务 · 点此暂停并查看"; break;
+            case RETRYING: message = "模型服务异常，正在重试 · 点此暂停"; break;
             default: message = "点此进入助手 · 执行中进入会暂停任务";
         }
         return new Notification.Builder(this, CHANNEL)
@@ -105,7 +106,7 @@ public final class OverlayService extends Service {
                 .setOngoing(true)
                 .setShowWhen(false)
                 .setOnlyAlertOnce(true)
-                .addAction(new Notification.Action.Builder(null, "结束任务", stop).build())
+                .addAction(new Notification.Action.Builder(null, "结束", stop).build())
                 .build();
     }
 

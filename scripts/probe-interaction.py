@@ -27,7 +27,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True)
     parser.add_argument("--timeout", type=float, default=180)
-    parser.add_argument("--only-memory", action="store_true", help="Check native memory loading/writing without the other protocol rounds")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--only-memory", action="store_true", help="Check native memory loading/writing without the other protocol rounds")
+    modes.add_argument("--only-retry", action="store_true", help="Capture native HTTP 500 retry events without file, question or memory rounds")
     args = parser.parse_args()
     deadline = time.monotonic() + args.timeout
     identity = "interaction-probe-" + uuid.uuid4().hex
@@ -65,9 +67,10 @@ def main():
     try:
         app(shlex.join(["mkdir", "-p", isolated + "/home/.claude/projects/-home-agent/memory", isolated + "/tmp", isolated + "/bridge"]))
         app("cat > " + shlex.quote(isolated + "/bridge/mcp.json"), b'{"mcpServers":{}}')
-        app("cat > " + shlex.quote(isolated + "/home/.claude/projects/-home-agent/memory/MEMORY.md"),
-            (fixture_module.MEMORY_MARKER + "\nThis is isolated probe memory.\n").encode())
-        app("cat > " + shlex.quote(isolated + "/home/CLAUDE.md"), (fixture_module.CLAUDE_MD_MARKER + "\n").encode())
+        if not args.only_retry:
+            app("cat > " + shlex.quote(isolated + "/home/.claude/projects/-home-agent/memory/MEMORY.md"),
+                (fixture_module.MEMORY_MARKER + "\nThis is isolated probe memory.\n").encode())
+            app("cat > " + shlex.quote(isolated + "/home/CLAUDE.md"), (fixture_module.CLAUDE_MD_MARKER + "\n").encode())
         adb("reverse", "tcp:" + str(port), "tcp:" + str(port))
         environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/home/agent", "USER": "agent", "LOGNAME": "agent",
                        "LANG": "C.UTF-8", "TERM": "dumb", "TMPDIR": "/tmp", "TZ": "Asia/Shanghai", "CI": "1",
@@ -124,6 +127,18 @@ def main():
 
         send({"type": "control_request", "request_id": "init-1", "request": {"subtype": "initialize"}})
         wait(lambda e: e.get("type") == "control_response", "initialize")
+        if args.only_retry:
+            user("PROBE_RETRY")
+            completed = wait(lambda e: e.get("type") == "result", "native retry")
+            retry_events = [event for event in received if event.get("type") == "system" and event.get("subtype") == "api_retry"]
+            assert not completed.get("is_error") and "PROBE_RETRY_OK" in completed.get("result", ""), "Native retry did not finish successfully"
+            assert fixture.retry_attempts == 2, "Fixture did not receive exactly one failed request and one retry"
+            assert retry_events, "Native CLI did not emit system/api_retry without partial-message output"
+            (output / "result.json").write_text(json.dumps({"result": "PASS", "partial_messages_enabled": False,
+                    "api_retry_events": retry_events, "final_num_turns": completed.get("num_turns"),
+                    "fixture_attempts": fixture.retry_attempts}, ensure_ascii=False, indent=2) + "\n")
+            print("PASS native retry", output, flush=True)
+            return
         if args.only_memory:
             user("PROBE_MEMORY")
             memory = wait(lambda e: e.get("type") == "result", "native memory")
@@ -162,12 +177,17 @@ def main():
     finally:
         if process:
             try:
-                app("kill -TERM $(cat " + shlex.quote(isolated + "/pid") + ")")
-            except Exception:
-                pass
-            try:
+                # EOF lets a completed interactive CLI exit before its PRoot tracer is signalled.
                 process.communicate(timeout=5)
             except subprocess.TimeoutExpired:
+                try:
+                    identity = app("cat " + shlex.quote(isolated + "/pid")).decode().strip()
+                    if identity.isdigit():
+                        app("kill -TERM " + identity)
+                    process.communicate(timeout=5)
+                except Exception:
+                    pass
+            if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
         fixture.stop.set()

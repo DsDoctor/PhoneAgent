@@ -3,6 +3,8 @@ package com.ds.phoneagent;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.app.KeyguardManager;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Path;
 import android.graphics.Rect;
@@ -18,18 +20,22 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** A small phone-tool executor. No sockets or exported command receiver. */
 public final class PhoneAccessibilityService extends AccessibilityService {
+    public enum ControlState { CONNECTED, SYSTEM_DISABLED, NOT_AUTHORIZED, DISCONNECTED }
     private static volatile PhoneAccessibilityService connected;
+    private static final CopyOnWriteArraySet<Runnable> connectionListeners = new CopyOnWriteArraySet<>();
     private final Handler main = new Handler(Looper.getMainLooper());
 
     @Override protected void onServiceConnected() {
         super.onServiceConnected();
         connected = this;
         OverlayService.onAccessibilityConnectionChanged();
+        notifyConnectionChanged();
     }
     @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
     @Override public void onInterrupt() { }
@@ -44,6 +50,34 @@ public final class PhoneAccessibilityService extends AccessibilityService {
 
     public static boolean isEnabled() { return connected != null; }
 
+    /** Read system authorization separately from this process's actual bound connection. */
+    public static ControlState getControlState(Context context) {
+        boolean systemEnabled = Settings.Secure.getInt(context.getContentResolver(),
+                Settings.Secure.ACCESSIBILITY_ENABLED, 0) == 1;
+        ComponentName ownService = new ComponentName(context, PhoneAccessibilityService.class);
+        String enabled = Settings.Secure.getString(context.getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        boolean authorized = false;
+        if (enabled != null) for (String name : enabled.split(":")) {
+            if (ownService.equals(ComponentName.unflattenFromString(name.trim()))) { authorized = true; break; }
+        }
+        if (!systemEnabled) return ControlState.SYSTEM_DISABLED;
+        if (!authorized) return ControlState.NOT_AUTHORIZED;
+        return connected == null ? ControlState.DISCONNECTED : ControlState.CONNECTED;
+    }
+
+    public static void addConnectionListener(Runnable listener) {
+        if (listener != null) connectionListeners.add(listener);
+    }
+
+    public static void removeConnectionListener(Runnable listener) {
+        if (listener != null) connectionListeners.remove(listener);
+    }
+
+    private void notifyConnectionChanged() {
+        for (Runnable listener : connectionListeners) main.post(listener);
+    }
+
     /** Main-thread only: this service's WindowManager carries its accessibility token. */
     static WindowManager overlayWindowManager() {
         PhoneAccessibilityService service = connected;
@@ -55,6 +89,7 @@ public final class PhoneAccessibilityService extends AccessibilityService {
         if (connected != this) return;
         connected = null;
         OverlayService.onAccessibilityConnectionChanged();
+        notifyConnectionChanged();
     }
 
     /** Call from a worker thread; gesture results reflect the system callback. */

@@ -1218,6 +1218,10 @@ public final class TestInstrumentation extends Instrumentation {
                     "Pause incorrectly completed the active task");
             check(interactionProcess(controller) == pausedProcess && pausedProcess != null && pausedProcess.isAlive(),
                     "Native pause destroyed the interactive process");
+            JSONObject pausedRecord = latestInteractionTurn(controller, pausedConversationId);
+            int interruptedTurns = pausedRecord.getInt("num_turns");
+            check(interruptedTurns > 0, "Paused native query did not persist its engine turns");
+            assertMetricQueryTotal(pausedRecord, 1, interruptedTurns);
             PhoneToolServer pausedBridge = (PhoneToolServer) accessibleField(AgentController.class, "bridge").get(controller);
             int statesBeforeBlockedTool = pausedProbe.states.size();
             Response blocked = request(pausedBridge, pausedBridge.token(), "read_screen");
@@ -1231,7 +1235,33 @@ public final class TestInstrumentation extends Instrumentation {
             awaitInteractionResult(controller, pausedProbe, "PROBE_AFTER_INTERRUPT_OK");
             check(pausedSession.equals(controller.getConversation(pausedConversationId).getString("session_id")),
                     "Pause/correction started a different Claude session");
+            JSONObject resumedRecord = latestInteractionTurn(controller, pausedConversationId);
+            check(resumedRecord.getInt("num_turns") == interruptedTurns + 1,
+                    "Continuation overwrote the interrupted query's engine turns with the final query's single turn");
+            assertMetricQueryTotal(resumedRecord, 2, interruptedTurns + 1);
+            log("Pause/correction accumulated native query turns: " + interruptedTurns + " + 1 = " + resumedRecord.getInt("num_turns"));
             log("Pause closed the bridge, rejected old action generation, and continued the same native session after correction");
+
+            ControllerProbe retryProbe = new ControllerProbe();
+            startInteraction(controller, retryProbe, "PROBE_RETRY");
+            awaitInteractionResult(controller, retryProbe, "PROBE_RETRY_OK");
+            JSONObject retryRecord = latestInteractionTurn(controller, controller.getActiveConversationId());
+            check(retryRecord.getInt("num_turns") == 1 && retryRecord.getInt("api_retry_count") == 1
+                            && retryRecord.getInt("model_reply_count") == 1,
+                    "HTTP 500 retry did not persist one engine turn, one retry and one model reply");
+            check(retryRecord.getInt("tool_call_count") == 0 && retryRecord.getInt("phone_action_count") == 0,
+                    "A model-only retry task invented a tool call or phone action");
+            String retryProcess = retryRecord.getString("process");
+            check(retryProcess.contains("500") && retryProcess.contains("重试"), "The HTTP 500 retry was hidden from the saved process");
+            check(retryProbe.states.contains(AgentController.VisualState.RETRYING), "The native retry did not publish RETRYING state");
+            assertMetricQueryTotal(retryRecord, 1, 1);
+            AtomicReference<Throwable> statsFailure = new AtomicReference<>();
+            runOnMainSync(() -> {
+                try { InteractionUiProbe.assertExecutionStats(resumedMain, retryRecord); }
+                catch (Throwable failure) { statsFailure.set(failure); }
+            });
+            if (statsFailure.get() != null) throw new AssertionError("Execution stats UI regression failed", statsFailure.get());
+            log("HTTP 500 retry published RETRYING and a visible process hint; persisted turns=1, retries=1, model replies=1");
 
             assertLiveQuestionStop(controller);
             check(changedModelKeys.isEmpty(), "Interaction test changed user model configuration keys");
@@ -1261,6 +1291,27 @@ public final class TestInstrumentation extends Instrumentation {
     private static final String INTERACTION_URL = "http://127.0.0.1:18081";
     private static final String INTERACTION_MODEL = "phoneagent-interaction-probe";
     private static final String INTERACTION_KEY = "local-interaction-probe-only";
+
+    private JSONObject latestInteractionTurn(AgentController controller, String conversationId) throws Exception {
+        JSONArray turns = controller.getConversation(conversationId).getJSONArray("turns");
+        check(turns.length() > 0, "Interaction conversation has no persisted turn");
+        return turns.getJSONObject(turns.length() - 1);
+    }
+
+    private void assertMetricQueryTotal(JSONObject turn, int expectedQueries, int expectedTotal) throws Exception {
+        JSONObject ledger = turn.getJSONObject("execution_metrics");
+        JSONObject queries = ledger.getJSONObject("queries");
+        check(queries.length() == expectedQueries && !ledger.optBoolean("incomplete"),
+                "Native query metrics are missing, duplicated or incomplete");
+        int total = 0;
+        java.util.Iterator<String> keys = queries.keys();
+        while (keys.hasNext()) {
+            int count = queries.getInt(keys.next());
+            check(count >= 0, "A completed/paused query remained unsettled in the replay ledger");
+            total += count;
+        }
+        check(total == expectedTotal && turn.getInt("num_turns") == total, "Engine turn total differs from its settled native queries");
+    }
 
     private void assertCancelledRuntimeRegistration(LinuxRuntime runtime) throws Exception {
         Process child = new ProcessBuilder("/system/bin/sleep", "30").start();

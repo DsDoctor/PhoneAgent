@@ -1,6 +1,10 @@
 """Offline regressions for the deterministic native-interaction fixture; no device or model."""
 import unittest
-from interaction_fixture import CLAUDE_MD_MARKER, Fixture, MEMORY_MARKER, QUESTION
+import json
+import threading
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+from interaction_fixture import CLAUDE_MD_MARKER, Fixture, KEY, MEMORY_MARKER, QUESTION
 
 
 def request(text, results=(), tools=()):
@@ -11,6 +15,28 @@ def request(text, results=(), tools=()):
 
 
 class InteractionFixtureTests(unittest.TestCase):
+    def test_retry_fixture_returns_one_http_500_then_a_success(self):
+        fixture = Fixture()
+        server = fixture.server()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        body = json.dumps(request("PROBE_RETRY")).encode()
+        operation = Request("http://127.0.0.1:" + str(server.server_address[1]) + "/v1/messages", body,
+                            headers={"x-api-key": KEY, "Content-Type": "application/json"})
+        try:
+            with self.assertRaises(HTTPError) as first:
+                urlopen(operation, timeout=3)
+            self.assertEqual(first.exception.code, 500)
+            self.assertEqual(json.loads(first.exception.read())["error"]["type"], "api_error")
+            first.exception.close()
+            with urlopen(operation, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["content"][0]["text"], "PROBE_RETRY_OK")
+            self.assertEqual(fixture.retry_attempts, 2)
+            self.assertEqual([r["prompt"] for r in fixture.requests], ["PROBE_RETRY", "PROBE_RETRY"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_recovered_answer_requires_original_native_question_and_current_user_answer(self):
         fixture = Fixture()
         original = fixture.response(request("PROBE_ASK", tools=["AskUserQuestion"]))["content"]

@@ -3,6 +3,7 @@ package com.ds.phoneagent;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.database.ContentObserver;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -12,6 +13,8 @@ import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
@@ -49,6 +52,8 @@ import java.util.Map;
 import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import java.security.KeyStore;
@@ -71,9 +76,13 @@ public final class MainActivity extends Activity {
     private static final int SUCCESS = Color.rgb(88, 112, 40);
     private static final int ERROR = Color.rgb(151, 67, 45);
     private static final String KEY_ALIAS = "phoneagent.api.key.v1";
+    private static final Pattern LEGACY_TURN_LINE = Pattern.compile("(?m)^[ \\t]*执行轮数[：:][ \\t]*(\\d+)[ \\t]*$");
+    private static final Pattern METRICS_FOOTER_LINES = Pattern.compile("(?m)^(?:累计执行轮次：\\d+（Claude Code，含中断）"
+            + "|模型回复：\\d+ 次 · 服务重试：\\d+ 次|工具调用：\\d+ 次 · 手机操作请求：\\d+ 次"
+            + "|统计不完整，以上为已记录的计数。)[ \\t]*$");
     private AgentController controller;
     private SharedPreferences preferences;
-    private TextView state, capabilities, connectionStatus;
+    private TextView state, capabilities, connectionStatus, controlHelp;
     private EditText prompt, baseUrl, model, apiKey;
     private Button send, stop, prepare, control, bubble, historyButton, newTaskButton, setupToggle;
     private SwipeDeleteRow revealedRow;
@@ -83,6 +92,7 @@ public final class MainActivity extends Activity {
     private boolean editingConnection;
     private boolean leavingForExecution;
     private boolean focusActiveInput;
+    private boolean observingControlState;
     private String renderedHistory = "";
     private String renderedInteraction = "";
     private long historyRenderVersion;
@@ -94,6 +104,12 @@ public final class MainActivity extends Activity {
     private final Set<String> expandedProcesses = new HashSet<>();
     private ScrollView contentScroll;
     private MonthlyCatView statePet;
+    private final Runnable connectionListener = () -> {
+        if (observingControlState && !isFinishing() && !isDestroyed()) refreshState();
+    };
+    private final ContentObserver controlSettingsObserver = new ContentObserver(new Handler(Looper.getMainLooper())) {
+        @Override public void onChange(boolean selfChange, Uri uri) { connectionListener.run(); }
+    };
 
     private final AgentController.Listener listener = new AgentController.Listener() {
         @Override public void onStatus(String text) {
@@ -168,6 +184,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        observeControlState();
         controller.setTaskUiVisible(true);
         if (!leavingForExecution && controller.isRunning()) {
             controller.pauseForUser();
@@ -180,6 +197,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        stopObservingControlState();
         OverlayService.setActivityVisible(false);
         controller.setTaskUiVisible(false);
         leavingForExecution = false;
@@ -215,8 +233,26 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        stopObservingControlState();
         controller.removeListener(listener);
         super.onDestroy();
+    }
+
+    private void observeControlState() {
+        if (observingControlState) return;
+        observingControlState = true;
+        PhoneAccessibilityService.addConnectionListener(connectionListener);
+        getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ACCESSIBILITY_ENABLED),
+                false, controlSettingsObserver);
+        getContentResolver().registerContentObserver(Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES),
+                false, controlSettingsObserver);
+    }
+
+    private void stopObservingControlState() {
+        if (!observingControlState) return;
+        observingControlState = false;
+        PhoneAccessibilityService.removeConnectionListener(connectionListener);
+        getContentResolver().unregisterContentObserver(controlSettingsObserver);
     }
 
     private void createUi() {
@@ -265,7 +301,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout connectionRow = horizontal();
         connectionRow.setGravity(Gravity.CENTER_VERTICAL);
-        connectionStatus = text("● 待配置", 13, MUTED);
+        connectionStatus = text("● 检查状态", 13, MUTED);
         connectionStatus.setPadding(dp(4), dp(8), dp(10), dp(8));
         connectionRow.addView(connectionStatus, new LinearLayout.LayoutParams(-2, -2));
         View separator = new View(this);
@@ -306,6 +342,9 @@ public final class MainActivity extends Activity {
         capabilities = text("", 12, MUTED);
         capabilities.setPadding(0, dp(7), 0, dp(8));
         setup.addView(capabilities);
+        controlHelp = text("", 12, MUTED);
+        controlHelp.setPadding(0, 0, 0, dp(8));
+        setup.addView(controlHelp);
         LinearLayout setupRow = horizontal();
         prepare = button("准备环境", true);
         control = button("开启手机控制", false);
@@ -379,10 +418,15 @@ public final class MainActivity extends Activity {
         actions.setGravity(Gravity.CENTER_VERTICAL);
         actions.setPadding(0, dp(7), 0, 0);
         send = button("开始执行", true);
+        send.setSingleLine(true);
+        send.setEllipsize(TextUtils.TruncateAt.END);
         send.setContentDescription("开始执行");
-        stop = plainButton("停止");
-        actions.addView(send, new LinearLayout.LayoutParams(0, -2, 3));
-        LinearLayout.LayoutParams stopSize = new LinearLayout.LayoutParams(0, -2, 1);
+        stop = plainButton("结束");
+        stop.setSingleLine(true);
+        stop.setMinWidth(dp(64));
+        stop.setMinimumWidth(dp(64));
+        actions.addView(send, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams stopSize = new LinearLayout.LayoutParams(-2, -2);
         stopSize.leftMargin = dp(8);
         actions.addView(stop, stopSize);
         composer.addView(actions);
@@ -448,7 +492,14 @@ public final class MainActivity extends Activity {
         String secret = apiKey.getText().toString().trim();
         if (!active && task.isEmpty()) { toast("先输入想让手机完成的任务"); return; }
         if (!controller.isReady()) { toast("请先准备环境"); return; }
-        if (!PhoneAccessibilityService.isEnabled()) { toast("请先开启 PhoneAgent 手机控制"); return; }
+        if (PhoneAccessibilityService.getControlState(this) != PhoneAccessibilityService.ControlState.CONNECTED) {
+            setupPanel.setVisibility(View.VISIBLE);
+            setupToggle.setText("连接与设置  ∧");
+            contentScroll.post(() -> contentScroll.smoothScrollTo(0, 0));
+            refreshState();
+            toast("手机控制尚未连接，请查看“连接与设置”中的提示。");
+            return;
+        }
         if (endpoint.isEmpty() || chosenModel.isEmpty() || secret.isEmpty()) {
             setupPanel.setVisibility(View.VISIBLE);
             setupToggle.setText("连接与设置  ∧");
@@ -507,19 +558,46 @@ public final class MainActivity extends Activity {
         boolean active = controller.hasActiveTask();
         statePet.setState(controller.getVisualState());
         boolean ready = controller.isReady();
-        boolean accessible = PhoneAccessibilityService.isEnabled();
+        PhoneAccessibilityService.ControlState controlState = PhoneAccessibilityService.getControlState(this);
+        boolean accessible = controlState == PhoneAccessibilityService.ControlState.CONNECTED;
         boolean overlay = Settings.canDrawOverlays(this) || accessible;
+        String controlLabel, controlStatus, controlHint;
+        switch (controlState) {
+            case SYSTEM_DISABLED:
+                controlLabel = "系统无障碍已关闭";
+                controlStatus = "控制已关闭";
+                controlHint = "系统无障碍总开关已关闭。请在系统设置中开启 PhoneAgent 手机控制；已保存的模型配置无需重填。";
+                break;
+            case NOT_AUTHORIZED:
+                controlLabel = "手机控制未授权";
+                controlStatus = "控制未授权";
+                controlHint = "首次使用需要在系统设置中开启 PhoneAgent 手机控制。正常授权后会保留。";
+                break;
+            case DISCONNECTED:
+                controlLabel = "手机控制已授权，服务未连接";
+                controlStatus = "控制未连接";
+                controlHint = "系统尚未连接手机控制服务。若一直未连接，请在系统设置中关闭后重新开启 PhoneAgent 手机控制。";
+                break;
+            default:
+                controlLabel = "手机控制已连接";
+                controlStatus = "已就绪";
+                controlHint = "手机控制已连接，正常退出应用后无需重复授权；系统关闭权限后，需要重新开启。";
+        }
         capabilities.setText((ready ? "环境已就绪" : "环境待准备") + "  ·  "
-                + (accessible ? "手机控制已开启" : "手机控制未开启") + "  ·  "
+                + controlLabel + "  ·  "
                 + (overlay ? "悬浮球可用" : "悬浮球待授权"));
-        boolean configured = baseUrl.length() > 0 && model.length() > 0 && apiKey.length() > 0;
-        connectionStatus.setText(ready && accessible && configured ? "● 已就绪" : "● 待配置");
-        connectionStatus.setTextColor(ready && accessible && configured ? SUCCESS : MUTED);
-        connectionStatus.setContentDescription(ready && accessible && configured
-                ? "运行环境、手机控制与模型配置已就绪" : "手机控制或模型连接待配置");
+        controlHelp.setText(controlHint);
+        boolean configured = !baseUrl.getText().toString().trim().isEmpty()
+                && !model.getText().toString().trim().isEmpty() && !apiKey.getText().toString().trim().isEmpty();
+        boolean available = ready && accessible && configured;
+        connectionStatus.setText("● " + (!ready ? "环境待准备" : !configured ? "模型待配置" : controlStatus));
+        connectionStatus.setTextColor(available ? SUCCESS : MUTED);
+        connectionStatus.setContentDescription((ready ? "运行环境已就绪" : "运行环境待准备") + "，"
+                + (configured ? "模型配置完整" : "模型配置不完整") + "，" + controlLabel);
         prepare.setText(ready ? "环境已就绪" : "准备环境");
         prepare.setEnabled(!active && !running && !ready);
-        control.setText(accessible ? "手机控制设置" : "开启手机控制");
+        control.setText(accessible ? "手机控制设置"
+                : controlState == PhoneAccessibilityService.ControlState.DISCONNECTED ? "检查手机控制设置" : "开启手机控制");
         bubble.setText(!overlay ? "开启悬浮球权限" : preferences.getBoolean("bubble_enabled", true) ? "隐藏悬浮球" : "显示悬浮球");
         boolean continuing = !showHistory && !selectedConversationId.isEmpty();
         JSONObject selected = continuing ? controller.getConversation(selectedConversationId) : null;
@@ -539,6 +617,7 @@ public final class MainActivity extends Activity {
                 if (!canSend) {
                     AgentController.VisualState phase = controller.getVisualState();
                     action = phase == AgentController.VisualState.RESUMING ? "继续中…"
+                            : phase == AgentController.VisualState.RETRYING ? "重试中…"
                             : phase == AgentController.VisualState.STOPPING ? "结束中…"
                             : phase == AgentController.VisualState.PAUSING ? "暂停中…" : "执行中…";
                     hint = phase == AgentController.VisualState.PAUSING ? "等待当前操作暂停后即可输入" : "当前任务正在处理中";
@@ -549,7 +628,7 @@ public final class MainActivity extends Activity {
         send.setContentDescription(action);
         send.setEnabled(!editingConnection && canSend);
         prompt.setHint(hint);
-        stop.setText(active || running ? "结束任务" : "重置");
+        stop.setText(active || running ? "结束" : "重置");
         stop.setContentDescription(active || running ? "结束任务" : "重置为待命");
         stop.setEnabled(active || running || controller.canResetToIdle());
         historyButton.setSelected(showHistory);
@@ -626,9 +705,11 @@ public final class MainActivity extends Activity {
         } else {
             String title = phase == AgentController.VisualState.PAUSED ? "任务已暂停"
                     : phase == AgentController.VisualState.RESUMING ? "正在继续任务"
+                    : phase == AgentController.VisualState.RETRYING ? "模型服务异常，正在重试"
                     : phase == AgentController.VisualState.STOPPING ? "正在结束任务" : "正在暂停任务";
             String message = accepting ? "在下方补充或纠正任务，点“发送并继续”。不需要修改时，可以直接继续执行。"
                     : phase == AgentController.VisualState.RESUMING ? "正在准备继续执行。"
+                    : phase == AgentController.VisualState.RETRYING ? "正在等待模型服务恢复，任务尚未结束。"
                     : phase == AgentController.VisualState.STOPPING ? "正在结束当前任务，请稍候。" : "正在等待已发出的手机操作结束，随后就能补充任务。";
             TextView heading = text(title, 18, INK);
             heading.setTypeface(Typeface.DEFAULT_BOLD); card.addView(heading);
@@ -981,14 +1062,25 @@ public final class MainActivity extends Activity {
         }
         String terminal = turn.optString("terminal");
         if (!terminal.isEmpty()) {
-            TextView footer = text(terminal.replace("【任务结束】\n", ""), 12, MUTED);
-            footer.setTextIsSelectable(true); footer.setLineSpacing(dp(2), 1);
-            footer.setPadding(dp(2), dp(12), dp(2), dp(2)); response.addView(footer);
+            // The old footer counted only the final CLI query. Present it with the metrics
+            // below rather than leaving an ambiguous total in this otherwise factual footer.
+            String presented = LEGACY_TURN_LINE.matcher(terminal.replace("【任务结束】\n", "")).replaceAll("").trim();
+            if (turn.optJSONObject("execution_metrics") != null)
+                presented = METRICS_FOOTER_LINES.matcher(presented).replaceAll("").trim();
+            if (!presented.isEmpty()) {
+                TextView footer = text(presented, 12, MUTED);
+                footer.setTextIsSelectable(true); footer.setLineSpacing(dp(2), 1);
+                footer.setPadding(dp(2), dp(12), dp(2), dp(2)); response.addView(footer);
+            }
         } else if ("running".equals(turnState) || "pausing".equals(turnState) || "paused".equals(turnState)
                 || "waiting_user".equals(turnState) || "resuming".equals(turnState)) {
             TextView status = text(turn.optString("status", "任务进行中…"), 12, ACCENT);
             status.setPadding(dp(2), dp(10), dp(2), dp(2)); response.addView(status);
         }
+        TextView metrics = text(executionStats(turn), 12, MUTED);
+        metrics.setTextIsSelectable(true); metrics.setLineSpacing(dp(2), 1);
+        metrics.setPadding(dp(2), dp(10), dp(2), dp(2));
+        response.addView(metrics, new LinearLayout.LayoutParams(-1, -2));
         if (!result.isEmpty()) {
             LinearLayout copyRow = horizontal();
             copyRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
@@ -1003,6 +1095,29 @@ public final class MainActivity extends Activity {
             response.addView(copyRow, new LinearLayout.LayoutParams(-1, -2));
         }
         addAligned(response, 0.94f, false, 0, 22);
+    }
+
+    /** Display-only migration: never treat a legacy final-query count as a task total. */
+    private String executionStats(JSONObject turn) {
+        JSONObject ledger = turn.optJSONObject("execution_metrics");
+        if (ledger == null || ledger.optInt("version") != 1) {
+            Integer count = LastTaskStore.optionalInt(turn, "num_turns");
+            String lastSegment = count == null ? "" : String.valueOf(count);
+            if (lastSegment.isEmpty()) {
+                Matcher old = LEGACY_TURN_LINE.matcher(turn.optString("terminal"));
+                if (old.find()) lastSegment = old.group(1);
+            }
+            return lastSegment.isEmpty() ? "旧版统计不完整"
+                    : "旧版末段轮次：" + lastSegment + "（未累计） · 旧版统计不完整";
+        }
+        ExecutionMetrics metrics = ExecutionMetrics.fromRecord(turn);
+        String note = "含暂停/中断轮次";
+        if (metrics.isIncomplete()) note += " · 统计不完整";
+        if (metrics.hasUnsettledQuery()) note += " · 尚未结算";
+        return "累计执行轮次 " + metrics.engineTurns() + "（Claude Code）\n"
+                + "回复 " + metrics.modelReplyCount() + " · 重试 " + metrics.apiRetryCount()
+                + " · 手机请求 " + metrics.phoneActionCount() + " · 工具调用 " + metrics.toolCallCount()
+                + "\n" + note;
     }
 
     /** Weight-based bubbles stay proportional after rotation and with larger system text. */

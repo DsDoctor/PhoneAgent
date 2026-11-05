@@ -43,8 +43,91 @@ public class StoreProbe {
         check(value.getString("interaction_answer").equals("选甲"),"Answer lost");
         check(!value.toString().contains("must-not-persist"),"Unknown sensitive field retained");
     }
+    static JSONObject assistant(String id,String tool) throws Exception {
+        JSONArray content=new JSONArray().put(new JSONObject().put("type","text").put("text","private output"));
+        if(tool!=null)content.put(new JSONObject().put("type","tool_use").put("id",tool).put("name","Read")
+            .put("input",new JSONObject().put("secret","must-not-persist")));
+        return new JSONObject().put("type","assistant").put("session_id",SESSION)
+            .put("uuid","event-"+id).put("message",new JSONObject().put("id",id).put("content",content));
+    }
+    static JSONObject result(String query,int turns) throws Exception {
+        return new JSONObject().put("type","result").put("session_id",SESSION).put("uuid","result-"+query)
+            .put("user_message_uuid",query).put("num_turns",turns);
+    }
+    static void metricsProbe(File root) throws Exception {
+        ExecutionMetrics metrics=new ExecutionMetrics();
+        metrics.beginQuery("q1");
+        JSONObject first=assistant("m1","tool1");
+        check(metrics.observe(first),"Initial assistant ignored");
+        check(!metrics.observe(first),"Assistant replay counted twice");
+        check(!metrics.observe(assistant("m1",null).put("uuid","another-block")),"Same API reply split into multiple messages counted twice");
+        metrics.observe(assistant("m2",null)); metrics.observe(result("q1",2));
+        metrics.beginQuery("q2");
+        for(int i=0;i<6;i++)metrics.observe(assistant("file-model-"+i,i<5?"file-tool-"+i:null));
+        metrics.observe(result("q2",6));
+        metrics.beginQuery("interrupted");
+        metrics.observe(result("interrupted",2).put("is_error",true).put("subtype","error_during_execution"));
+        JSONObject retry=new JSONObject().put("type","system").put("subtype","api_retry").put("uuid","retry1")
+            .put("session_id",SESSION).put("attempt",1).put("error_status",500);
+        metrics.observe(retry); metrics.recordPhoneAction("phone-action-1");
+        JSONObject paused=record("paused"); metrics.writeTo(paused);
+        check(!paused.getJSONObject("execution_metrics").toString().contains("must-not-persist"),"Tool arguments leaked into metrics");
+        LastTaskStore last=new LastTaskStore(new File(root,"metrics-last")); last.write(paused);
+        metrics=ExecutionMetrics.fromRecord(new LastTaskStore(new File(root,"metrics-last")).recoverInterrupted());
+        check(!metrics.observe(first)&&!metrics.observe(retry)&&!metrics.recordPhoneAction("phone-action-1"),"Persisted ledger replay counted twice");
+        check(!metrics.observe(result("q2",6)),"Old result replay recounted after resume");
+        metrics.beginQuery("q4"); metrics.observe(assistant("m9",null)); metrics.observe(result("q4",1));
+        check(metrics.engineTurns()==11,"Per-query engine rounds not accumulated including interrupted result");
+        check(metrics.modelReplyCount()==9&&metrics.toolCallCount()==6,"Model/tool semantics incorrect");
+        check(metrics.apiRetryCount()==1&&metrics.phoneActionCount()==1,"Retry/phone counters incorrect");
+        check(!metrics.isIncomplete()&&!metrics.hasUnsettledQuery(),"Settled task unexpectedly incomplete");
+        metrics.observe(new JSONObject(retry.toString()).put("uuid","retry2"));
+        check(metrics.apiRetryCount()==2,"Repeated attempt=1 on distinct request chain was deduplicated");
+        TaskHistoryStore history=new TaskHistoryStore(new File(root,"metrics-history"));history.initialize(null);
+        JSONObject started=history.beginTurn("","metrics");String cid=started.getString("conversation_id"),tid=started.getString("turn_id");
+        metrics.writeTo(paused);history.updateTurn(cid,tid,paused);
+        history.updateTurn(cid,tid,record("paused")); // Older progress caller must not drop the ledger.
+        history=new TaskHistoryStore(new File(root,"metrics-history"));history.initialize(null);
+        ExecutionMetrics restored=ExecutionMetrics.fromRecord(lastTurn(history.getConversation(cid)));
+        check(restored.engineTurns()==11&&restored.apiRetryCount()==2&&restored.modelReplyCount()==9,"History normalized away metrics");
+        check(!restored.observe(result("q4",1))&&!restored.observe(retry),"History recovery lost deduplication");
+        ExecutionMetrics unsettled=new ExecutionMetrics();unsettled.beginQuery("unfinished");
+        unsettled.observe(assistant("unfinished-reply","unfinished-tool"));unsettled.observe(retry);
+        JSONObject running=record("running");unsettled.writeTo(running);
+        LastTaskStore crashed=new LastTaskStore(new File(root,"metrics-crashed-last"));crashed.write(running);
+        JSONObject recovered=crashed.recoverInterrupted();String recoveredOutput=recovered.getString("output");
+        check(recoveredOutput.contains(unsettled.summary())&&recoveredOutput.contains("统计不完整"),"Last-task crash footer lost unsettled metrics");
+        check(!recoveredOutput.contains("\n执行轮数：0"),"Last-task recovery mislabeled an unsettled zero as complete");
+        ExecutionMetrics recoveredMetrics=ExecutionMetrics.fromRecord(recovered);
+        check(recoveredMetrics.hasUnsettledQuery()&&recoveredMetrics.modelReplyCount()==1&&!recoveredMetrics.observe(retry),"Crash recovery changed replay ledger");
+        String recoveredOnce=recovered.toString();
+        check(new LastTaskStore(new File(root,"metrics-crashed-last")).recoverInterrupted().toString().equals(recoveredOnce),"Modern crash recovery duplicated footer");
+        TaskHistoryStore crashedHistory=new TaskHistoryStore(new File(root,"metrics-crashed-history"));crashedHistory.initialize(null);
+        JSONObject crashStart=crashedHistory.beginTurn("","unfinished");String crashCid=crashStart.getString("conversation_id"),crashTid=crashStart.getString("turn_id");
+        crashedHistory.updateTurn(crashCid,crashTid,running);
+        crashedHistory=new TaskHistoryStore(new File(root,"metrics-crashed-history"));crashedHistory.initialize(null);
+        JSONObject recoveredTurn=lastTurn(crashedHistory.getConversation(crashCid));String recoveredTerminal=recoveredTurn.getString("terminal");
+        check(recoveredTerminal.contains(unsettled.summary())&&recoveredTerminal.contains("统计不完整"),"History crash footer lost unsettled metrics");
+        check(!recoveredTerminal.contains("\n执行轮数：0")&&ExecutionMetrics.fromRecord(recoveredTurn).hasUnsettledQuery(),"History crash recovery presented a complete zero");
+        LastTaskStore legacyCrash=new LastTaskStore(new File(root,"legacy-crash"));legacyCrash.write(record("running").put("num_turns",2));
+        String legacyOutput=legacyCrash.recoverInterrupted().getString("output");
+        check(legacyOutput.contains("\n执行轮数：2")&&!legacyOutput.contains("累计执行轮次"),"Legacy recovery presentation changed");
+        check(ExecutionMetrics.fromRecord(new JSONObject().put("num_turns",2)).isIncomplete(),"Legacy final-query value called complete");
+        ExecutionMetrics bounded=new ExecutionMetrics();
+        for(int i=0;i<ExecutionMetrics.MAX_IDENTITIES+100;i++)bounded.recordPhoneAction("bounded-"+i);
+        JSONObject saved=new JSONObject();bounded.writeTo(saved);
+        check(saved.toString().length()<100000,"Replay ledger exceeded serialized bound");
+        bounded=ExecutionMetrics.fromRecord(saved);
+        check(bounded.isIncomplete()&&bounded.phoneActionCount()==ExecutionMetrics.MAX_IDENTITIES,"Ledger limit must retain a lower bound");
+        check(!bounded.recordPhoneAction("bounded-0")&&!bounded.recordPhoneAction("never-seen"),"Bounded replay ledger evicted IDs or grew after restore");
+        ExecutionMetrics uncorrelated=new ExecutionMetrics();uncorrelated.beginQuery("unknown-query");
+        JSONObject oldResult=result("old",3);oldResult.remove("user_message_uuid");
+        uncorrelated.observe(oldResult);uncorrelated.observe(oldResult);
+        check(uncorrelated.engineTurns()==3&&uncorrelated.isIncomplete(),"Uncorrelated result replay inflated rounds");
+    }
     public static void main(String[] args) throws Exception {
         File root=new File(args[0]);
+        metricsProbe(root);
         for(String state:new String[]{"paused","waiting_user","pausing","resuming"}) {
             File directory=new File(root,"last-"+state);
             LastTaskStore store=new LastTaskStore(directory); store.write(record(state));
@@ -135,7 +218,8 @@ class InteractionStoreTests(unittest.TestCase):
             classes.mkdir()
             real = ROOT / "app/src/main/java/com/ds/phoneagent"
             compilation = subprocess.run([str(jdk / "bin/javac"), "-encoding", "UTF-8", "-d", str(classes),
-                *map(str, (temp / "src").rglob("*.java")), str(real / "LastTaskStore.java"), str(real / "TaskHistoryStore.java")],
+                *map(str, (temp / "src").rglob("*.java")), str(real / "LastTaskStore.java"), str(real / "TaskHistoryStore.java"),
+                str(real / "ExecutionMetrics.java")],
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(compilation.returncode, 0, compilation.stderr)
             result = subprocess.run([str(jdk / "bin/java"), "-cp", str(classes), "com.ds.phoneagent.StoreProbe", str(temp / "data")],

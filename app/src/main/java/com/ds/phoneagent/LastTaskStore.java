@@ -90,8 +90,10 @@ final class LastTaskStore {
             record.put("updated_at", now);
             record.put("ended_at", now);
             String previous = record.optString("output");
+            boolean hasMetrics = record.has("execution_metrics");
             String footer = terminalFooter("中断", "应用重新启动时，上次任务尚未完成。",
-                    optionalInt(record, "exit_code"), optionalInt(record, "num_turns"));
+                    optionalInt(record, "exit_code"), hasMetrics ? null : optionalInt(record, "num_turns"));
+            if (hasMetrics) footer += "\n" + ExecutionMetrics.fromRecord(record).summary();
             record.put("output", tail(previous + (previous.isEmpty() ? "" : "\n\n") + footer));
             try { write(record); }
             catch (IOException unavailable) {
@@ -219,9 +221,9 @@ final class LastTaskStore {
             result.put("started_at", Math.max(0, source.optLong("started_at")));
             result.put("updated_at", Math.max(0, source.optLong("updated_at")));
             result.put("ended_at", Math.max(0, source.optLong("ended_at")));
-            Integer exit = optionalInt(source, "exit_code"), turns = optionalInt(source, "num_turns");
+            Integer exit = optionalInt(source, "exit_code");
             if (exit != null) result.put("exit_code", exit);
-            if (turns != null) result.put("num_turns", turns);
+            ExecutionMetrics.copyFields(source, result);
             for (String field : new String[]{"conversation_id", "turn_id", "session_id"}) {
                 String value = source.optString(field);
                 if (LinuxRuntime.isSessionId(value)) result.put(field, value);

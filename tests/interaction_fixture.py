@@ -11,11 +11,18 @@ MEMORY_MARKER = "PHONEAGENT_NATIVE_MEMORY_20261105"
 CLAUDE_MD_MARKER = "PHONEAGENT_NATIVE_CLAUDE_MD_20261105"
 
 
+class FixtureHttpError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class Fixture:
     def __init__(self):
         self.requests = []
         self.slow_started = threading.Event()
         self.stop = threading.Event()
+        self.retry_attempts = 0
 
     def response(self, body):
         messages = body.get("messages", [])
@@ -23,7 +30,7 @@ class Fixture:
             b.get("text", "") for b in m.get("content", []) if b.get("type") == "text")
         # Claude may merge interrupted and replacement user messages into one API message.
         markers = [marker for m in messages if m.get("role") == "user"
-                   for marker in re.findall(r"PROBE_(?:RECOVERED_ANSWER|AFTER_INTERRUPT|INTERRUPT|FILES|MEMORY|ASK)", text(m))]
+                   for marker in re.findall(r"PROBE_(?:RECOVERED_ANSWER|AFTER_INTERRUPT|INTERRUPT|FILES|MEMORY|RETRY|ASK)", text(m))]
         prompt = markers[-1] if markers else ""
         tools = {t["name"] for t in body.get("tools", [])}
         self.requests.append({"prompt": prompt, "tools": sorted(tools),
@@ -32,7 +39,12 @@ class Fixture:
         results = [b for m in messages if isinstance(m.get("content"), list)
                    for b in m["content"] if b.get("type") == "tool_result"]
         completed = {b.get("tool_use_id"): b for b in results}
-        if prompt == "PROBE_RECOVERED_ANSWER":
+        if prompt == "PROBE_RETRY":
+            self.retry_attempts += 1
+            if self.retry_attempts == 1:
+                raise FixtureHttpError(500, "Synthetic local retry fixture failure")
+            block = {"type": "text", "text": "PROBE_RETRY_OK"}
+        elif prompt == "PROBE_RECOVERED_ANSWER":
             assert any(m.get("role") == "user" and "PROBE_ASK" in text(m) for m in messages), "Original question prompt was not resumed"
             assert any(m.get("role") == "assistant" and isinstance(m.get("content"), list)
                        and any(b.get("type") == "tool_use" and b.get("name") == "AskUserQuestion" for b in m["content"])
@@ -112,6 +124,9 @@ class Fixture:
                     return
                 try:
                     response = fixture.response(body)
+                except FixtureHttpError as error:
+                    self.respond(error.status, {"type": "error", "error": {"type": "api_error", "message": str(error)}})
+                    return
                 except Exception as error:
                     self.respond(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(error)}})
                     return

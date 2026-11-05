@@ -32,8 +32,13 @@ public final class ClaudeTransport implements Closeable {
     }
 
     public String sendUser(String text) throws IOException {
+        return sendUser(text, UUID.randomUUID().toString());
+    }
+
+    /** The Controller persists the query identity before its first byte is sent. */
+    public String sendUser(String text, String identity) throws IOException {
         if (text == null || text.trim().isEmpty()) throw new IOException("用户输入不能为空");
-        String identity = UUID.randomUUID().toString();
+        if (identity == null || identity.isEmpty()) throw new IOException("用户消息标识缺失");
         write(object("type", "user", "message", object("role", "user", "content", text),
                 "parent_tool_use_id", JSONObject.NULL, "session_id", "", "uuid", identity));
         return identity;

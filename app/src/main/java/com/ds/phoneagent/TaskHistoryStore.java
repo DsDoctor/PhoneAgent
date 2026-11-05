@@ -77,8 +77,10 @@ final class TaskHistoryStore {
                     }
                     if (!"running".equals(turn.optString("state"))) continue;
                     long now = System.currentTimeMillis();
+                    boolean hasMetrics = turn.has("execution_metrics");
                     String terminal = LastTaskStore.terminalFooter("中断", "应用重新启动时，上次任务尚未完成。",
-                            LastTaskStore.optionalInt(turn, "exit_code"), LastTaskStore.optionalInt(turn, "num_turns"));
+                            LastTaskStore.optionalInt(turn, "exit_code"), hasMetrics ? null : LastTaskStore.optionalInt(turn, "num_turns"));
+                    if (hasMetrics) terminal += "\n" + ExecutionMetrics.fromRecord(turn).summary();
                     turn.put("state", "interrupted").put("reason", "process_interrupted")
                             .put("status", "上次任务在运行中被中断，已恢复之前的记录。")
                             .put("terminal", terminal)
@@ -163,6 +165,7 @@ final class TaskHistoryStore {
                         && previous.has("pending_question")) incoming.put("pending_question", previous.get("pending_question"));
                 if (!incoming.has("interaction_answer") && previous.has("interaction_answer"))
                     incoming.put("interaction_answer", previous.get("interaction_answer"));
+                ExecutionMetrics.preserveIfMissing(previous, incoming);
                 JSONObject clean = normalizeTurn(incoming);
                 clean.put("id", turnId);
                 turns.put(i, clean);
@@ -282,10 +285,11 @@ final class TaskHistoryStore {
         for (String key : new String[]{"prompt", "process", "result", "terminal", "output"}) clean.put(key, LastTaskStore.tail(source.optString(key)));
         clean.put("status", clip(source.optString("status"), 1024)).put("reason", clip(source.optString("reason"), 80));
         for (String key : new String[]{"started_at", "updated_at", "ended_at"}) clean.put(key, Math.max(0, source.optLong(key)));
-        for (String key : new String[]{"exit_code", "num_turns"}) {
+        for (String key : new String[]{"exit_code"}) {
             Integer value = LastTaskStore.optionalInt(source, key);
             if (value != null) clean.put(key, value);
         }
+        ExecutionMetrics.copyFields(source, clean);
         LastTaskStore.copyInteraction(source, clean);
         return clean;
     }

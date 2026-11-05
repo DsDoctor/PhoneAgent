@@ -29,6 +29,26 @@ import java.util.Set;
 
 /** Main-thread UI assertions against an isolated waiting Controller; never submits a task. */
 final class InteractionUiProbe {
+    static void assertExecutionStats(MainActivity activity, JSONObject actualRecord) throws Exception {
+        check(Looper.myLooper() == Looper.getMainLooper(), "Run execution-stats UI assertions on the main thread");
+        Method stats = method("executionStats", JSONObject.class);
+        String modern = (String) stats.invoke(activity, actualRecord);
+        check(modern.contains("累计执行轮次 " + actualRecord.getInt("num_turns") + "（Claude Code）")
+                        && modern.contains("重试 " + actualRecord.getInt("api_retry_count"))
+                        && modern.contains("含暂停/中断轮次") && !modern.contains("未累计"),
+                "Modern execution stats did not render the persisted cumulative counters");
+        String legacy = (String) stats.invoke(activity, new JSONObject().put("num_turns", 7));
+        check(legacy.contains("旧版末段轮次：7（未累计）") && legacy.contains("旧版统计不完整"),
+                "Legacy final-segment count was presented as a cumulative total");
+        JSONObject partial = new JSONObject(actualRecord.toString());
+        JSONObject ledger = partial.getJSONObject("execution_metrics");
+        ledger.put("incomplete", true);
+        ledger.getJSONObject("queries").put("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", -1);
+        String incomplete = (String) stats.invoke(activity, partial);
+        check(incomplete.contains("统计不完整") && incomplete.contains("尚未结算"),
+                "Incomplete/unsettled metrics lost their visible qualifications");
+    }
+
     static void run(MainActivity activity, AgentController waitingController) throws Exception {
         run(activity, waitingController, null);
     }
@@ -55,7 +75,15 @@ final class InteractionUiProbe {
             TextView stop = (TextView) field(MainActivity.class, "stop").get(activity);
             View panel = (View) field(MainActivity.class, "interactionPanel").get(activity);
             check("回答并继续".contentEquals(send.getText()) && send.isEnabled(), "Question UI lacks its explicit submit action");
-            check("结束任务".contentEquals(stop.getText()) && stop.isEnabled(), "Waiting task cannot be ended");
+            check("结束".contentEquals(stop.getText()) && stop.isEnabled(), "Waiting task cannot be ended");
+            check(stop.getMaxLines() == 1 && send.getMaxLines() == 1,
+                    "Task action buttons are allowed to wrap onto another line");
+            check(stop.getLayoutParams().width == ViewGroup.LayoutParams.WRAP_CONTENT,
+                    "The short End action lost its content-sized layout");
+            TextView connection = (TextView) field(MainActivity.class, "connectionStatus").get(activity);
+            check(PhoneAccessibilityService.getControlState(activity) == PhoneAccessibilityService.ControlState.CONNECTED
+                            && connection.getContentDescription().toString().contains("手机控制已连接"),
+                    "A bound accessibility service was rendered as missing configuration or disconnected");
 
             JSONArray nativeQuestions = pending.getJSONObject("input").getJSONArray("questions");
             JSONObject nativeQuestion = nativeQuestions.getJSONObject(0);

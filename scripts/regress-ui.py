@@ -41,7 +41,7 @@ FILES = ("files/task-history.json", "files/last-task.json", "shared_prefs/phonea
 HINTS = {"", "想让月薪喵做什么？", "接下来，还想让我做什么？", "例如：打开系统设置"}
 SAFE_CONTROLS = {"新任务", "打开最近任务", "连接与设置", "任务输入", "模型",
                  "展开执行过程", "收起执行过程"}
-FORBIDDEN_CONTROLS = {"开始执行", "继续对话", "停止任务", "重置为待命", "删除此任务"}
+FORBIDDEN_CONTROLS = {"开始执行", "继续对话", "停止任务", "结束任务", "重置为待命", "删除此任务"}
 ROTATION_KEYS = ("accelerometer_rotation", "user_rotation")
 
 
@@ -318,12 +318,13 @@ class Regression:
 
     @staticmethod
     def assert_idle_ui(ui: Ui):
-        require(ui.find("停止任务", False) is None, "An active task was observed; no further UI test actions allowed")
+        require(all(ui.find(action, False) is None for action in ("停止任务", "结束任务")),
+                "An active task was observed; no further UI test actions allowed")
 
     def tap(self, node: Node):
         require(node.package == PACKAGE and node.enabled, "Tap target is outside PhoneAgent or disabled")
         require(node.desc not in FORBIDDEN_CONTROLS and node.text not in {
-            "删除", "保存连接配置", "开始执行", "继续对话", "停止", "重置"}, "Refusing a state-changing task/config action")
+            "删除", "保存连接配置", "开始执行", "继续对话", "停止", "结束", "结束任务", "重置"}, "Refusing a state-changing task/config action")
         row = node.kind == "android.widget.FrameLayout" and node.clickable and node.desc.endswith("，查看任务")
         model_toggle = node.kind == "android.widget.Button" and node.text == "连接模型  ›"
         require(node.desc in SAFE_CONTROLS or row or model_toggle, "Tap target is not an allowed navigation/input control")

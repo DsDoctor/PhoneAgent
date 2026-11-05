@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
 
 /** Owns one task at a time; the actual agent loop belongs to Claude Code. */
 public final class AgentController {
-    public enum VisualState { IDLE, PREPARING, THINKING, ACTING, SUCCESS, NEEDS_INPUT, ERROR, STOPPING, STOPPED, PAUSING, PAUSED, WAITING_USER, RESUMING }
+    public enum VisualState { IDLE, PREPARING, THINKING, ACTING, SUCCESS, NEEDS_INPUT, ERROR, STOPPING, STOPPED, PAUSING, PAUSED, WAITING_USER, RESUMING, RETRYING }
     public interface Listener {
         void onStatus(String status);
         void onOutput(String output);
@@ -53,6 +53,7 @@ public final class AgentController {
     private volatile String initializeId = "", interruptId = "";
     private Runnable deferredResume;
     private PowerManager.WakeLock taskWakeLock;
+    private Runnable taskTicker;
 
     private AgentController(Context context) {
         this(context, new LinuxRuntime(context));
@@ -299,6 +300,7 @@ public final class AgentController {
                 Integer value = LastTaskStore.optionalInt(turn, field);
                 if (value != null) fallback.put(field, value);
             }
+            ExecutionMetrics.copyFields(turn, fallback);
             return taskStore.acknowledge(fallback);
         } catch (Exception unavailable) { return false; }
     }
@@ -310,11 +312,13 @@ public final class AgentController {
     }
     private void phase(long epoch, VisualState value, String message) {
         main.post(() -> {
-            if (epoch != presentationEpoch.get() || !running || cancelled || isSuspended()) return;
-            lastStatus = message;
-            publishVisualState(value);
-            Listener l = listener;
-            if (l != null) l.onStatus(message);
+            synchronized (AgentController.this) {
+                if (epoch != presentationEpoch.get() || !running || cancelled || isSuspended()) return;
+                lastStatus = message;
+                publishVisualState(value);
+                Listener l = listener;
+                if (l != null) l.onStatus(message);
+            }
         });
     }
     private void output(long epoch, String value) {
@@ -331,6 +335,8 @@ public final class AgentController {
             synchronized (AgentController.this) {
                 if (epoch != presentationEpoch.get()) return;
                 actionGate.close();
+                if (taskTicker != null) main.removeCallbacks(taskTicker);
+                taskTicker = null;
                 running = false;
                 pauseRequested = false;
                 pendingQuestion = null;
@@ -418,7 +424,7 @@ public final class AgentController {
         if (hasActiveTask()) return;
         if (prompt == null || prompt.trim().isEmpty()) { needsInput("先输入要手机完成的事情。"); return; }
         if (!isReady()) { needsInput("请先准备运行环境。"); return; }
-        if (!PhoneAccessibilityService.isEnabled()) { needsInput("请先在系统设置中开启 PhoneAgent 无障碍服务。"); return; }
+        if (PhoneAccessibilityService.getControlState(context) != PhoneAccessibilityService.ControlState.CONNECTED) { needsInput("手机控制尚未连接，请在系统设置中开启 PhoneAgent 并等待连接。"); return; }
         try {
             URI url = new URI(baseUrl.trim());
             boolean local = "127.0.0.1".equals(url.getHost()) || "localhost".equals(url.getHost());
@@ -448,6 +454,7 @@ public final class AgentController {
             return;
         }
         activeTask = task;
+        startTaskTicker(task);
         final String session = resumeSession;
         task.progress(session.isEmpty() ? "正在连接模型…" : "正在恢复原会话…");
         historyChanged(epoch);
@@ -590,8 +597,10 @@ public final class AgentController {
                     if (channel != null && channel == transport && channel.getProcess().isAlive()) {
                         boolean firstUser = !userSent;
                         userSent = true;
-                        if (question != null) channel.answerQuestion(question.optString("id"), question.optJSONObject("input"), answers);
-                        else channel.sendUser(firstUser ? "原任务：" + task.prompt + "\n" + prompt : prompt);
+                        if (question != null) {
+                            channel.answerQuestion(question.optString("id"), question.optJSONObject("input"), answers);
+                            task.activity(VisualState.THINKING, "回答已提交，正在等待模型响应…");
+                        } else task.sendUser(channel, firstUser ? "原任务：" + task.prompt + "\n" + prompt : prompt);
                     } else {
                         initialized = false; userSent = false;
                         worker.execute(() -> runTask(task, prompt, baseUrl.trim(), model.trim(), apiKey.trim(), task.sessionId));
@@ -621,6 +630,8 @@ public final class AgentController {
                 started, turn.optString("prompt"));
         task.processText = turn.optString("process"); task.finalResult = turn.optString("result");
         task.interactionAnswer = turn.optString("interaction_answer");
+        task.metrics = ExecutionMetrics.fromRecord(turn);
+        startTaskTicker(task);
         task.pending = copy(pendingQuestion); task.storedState = pendingQuestion == null ? "paused" : "waiting_user";
         task.rebuildOutput();
         return task;
@@ -628,7 +639,7 @@ public final class AgentController {
     private void runTask(TaskRun task, String prompt, String baseUrl, String model, String apiKey, String resumeSession) {
         long epoch = task.epoch;
         boolean ok = false, sawResult = false;
-        Integer exitCode = null, turns = null;
+        Integer exitCode = null;
         String reason = "cli_no_result", detail = "执行连接中断，没有收到最终结果。", errorCategory = "";
         Process child = null;
         PhoneToolServer server = null;
@@ -640,9 +651,10 @@ public final class AgentController {
                 @Override public void onTool(String name) {
                     if (cancelled || isSuspended()) return;
                     String label = "正在操作手机：" + toolLabel(name);
-                    task.progress(label); phase(epoch, VisualState.ACTING, label);
+                    task.phoneAction();
+                    task.activity(VisualState.ACTING, label);
                 }
-                @Override public void onToolFinished(String name) { phase(epoch, VisualState.THINKING, "正在思考下一步…"); }
+                @Override public void onToolFinished(String name) { task.activity(VisualState.THINKING, "手机工具已返回，正在等待下一步…"); }
             }, actionGate);
             bridge = server;
             if (cancelled) throw new CancellationException();
@@ -662,6 +674,7 @@ public final class AgentController {
                     try { event = new JSONObject(line); }
                     catch (Exception notJson) { if (!line.trim().isEmpty()) task.diagnostic(); continue; }
                     String type = event.optString("type");
+                    task.observeEvent(event); // Include interrupted results before the pause branch consumes them.
                     if (type.equals("result") || type.equals("system") && event.optString("subtype").equals("init"))
                         task.captureSession(event.optString("session_id"), resumeSession);
                     if (type.equals("control_response")) {
@@ -676,7 +689,7 @@ public final class AgentController {
                                         if (cancelled || pauseRequested || userSent || readyChannel != transport) return;
                                         try {
                                             actionGate.open(); userSent = true;
-                                            readyChannel.sendUser(prompt);
+                                            task.sendUser(readyChannel, prompt);
                                         } catch (IOException unavailable) { terminate(readyChannel.getProcess()); }
                                     });
                                 } else if (pauseRequested) settlePauseIfReady(task);
@@ -750,7 +763,6 @@ public final class AgentController {
                             finishing = true; // A later cat click must not reopen an already completed turn.
                         }
                         sawResult = true;
-                        turns = LastTaskStore.optionalInt(event, "num_turns");
                         String subtype = event.optString("subtype", "success");
                         ok = !event.optBoolean("is_error", false) && "success".equals(subtype);
                         reason = ok ? "success" : "error_result";
@@ -758,7 +770,7 @@ public final class AgentController {
                         if (ok) task.appendResult(event.optString("result", ""));
                         break; // Interactive CLI deliberately keeps stdin open after a turn.
                     } else if (type.equals("system") && event.optString("subtype").equals("init")) {
-                        if (!isSuspended()) task.progress("模型已连接，正在处理任务…");
+                        if (!isSuspended()) task.activity(VisualState.THINKING, "模型已连接，正在等待响应…");
                     }
                 }
             }
@@ -803,8 +815,33 @@ public final class AgentController {
         if (!cancelled && !sawResult && !errorCategory.isEmpty()) detail += "\n错误类别：" + errorCategory;
         String state = cancelled ? "stopped" : ok ? "success" : "error";
         String message = cancelled ? "已停止任务，记录已保留。" : ok ? "本次指令已结束。" : "本次指令未完成，请查看任务记录。";
-        String transcript = task.finish(state, message, reason, detail, exitCode, turns);
+        String transcript = task.finish(state, message, reason, detail, exitCode);
         finished(epoch, cancelled ? VisualState.STOPPED : ok ? VisualState.SUCCESS : VisualState.ERROR, ok, message, transcript);
+    }
+
+    /** UI heartbeat only; no model call and no storage write every second. */
+    private void startTaskTicker(TaskRun task) {
+        main.post(() -> {
+            if (taskTicker != null) main.removeCallbacks(taskTicker);
+            taskTicker = new Runnable() {
+                @Override public void run() {
+                    synchronized (AgentController.this) {
+                        if (activeTask != task || task.epoch != presentationEpoch.get()) return;
+                        // The CLI reader may enter WAITING_USER while the heartbeat runs.
+                        // Publish under the same lock so an old wait status cannot replace it.
+                        if (running && !cancelled && !finishing && !isSuspended()) {
+                            String text = task.liveStatus();
+                            lastStatus = text;
+                            Listener current = listener;
+                            if (current != null) current.onStatus(text);
+                            task.recordLongWait();
+                        }
+                    }
+                    main.postDelayed(this, 1000);
+                }
+            };
+            main.post(taskTicker);
+        });
     }
 
     /** Serializes output and persistence from the CLI reader and the tool observer. */
@@ -814,6 +851,12 @@ public final class AgentController {
         String transcript = "", processText = "", finalResult = "", terminalText = "", sessionId;
         String status = "正在连接模型…", storedState = "running", interactionAnswer = "";
         JSONObject pending;
+        ExecutionMetrics metrics = new ExecutionMetrics();
+        final java.util.Map<String, String> activeTools = new java.util.HashMap<>();
+        VisualState activityPhase = VisualState.THINKING;
+        String activityText = "正在连接模型…";
+        long activityAt = android.os.SystemClock.elapsedRealtime(), waitingAt = activityAt, retryAt, lastWaitLogAt = activityAt;
+        int retryAttempt, retryHttp;
         boolean done, sawDiagnostic, saveFailed, sessionConfirmed;
         TaskRun(long epoch, String key, String endpoint, JSONObject started, String prompt) throws Exception {
             this.epoch = epoch; this.key = key; this.endpoint = endpoint;
@@ -832,12 +875,118 @@ public final class AgentController {
             if (normalized.equals(sessionId)) return;
             historyStore.bindSession(conversationId, normalized);
             sessionId = normalized;
-            save(storedState, "", null, null, 0);
+            save(storedState, "", null, 0);
         }
-        synchronized void progress(String message) {
-            if (done || !storedState.equals("running")) return;
-            status = message;
+        synchronized void progress(String message) { activity(VisualState.THINKING, message); }
+        synchronized void activity(VisualState value, String message) {
+            if (done || !storedState.equals("running") || cancelled || isSuspended()) return;
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (value == VisualState.ACTING) waitingAt = 0;
+            else if (waitingAt == 0) waitingAt = now;
+            activityAt = now; lastWaitLogAt = now;
+            activityPhase = value; activityText = message; status = message;
+            if (value != VisualState.RETRYING) retryAt = 0;
             append("【进度】" + message);
+            phase(epoch, value, message);
+        }
+        synchronized void sendUser(ClaudeTransport channel, String text) throws IOException {
+            String identity = java.util.UUID.randomUUID().toString();
+            metrics.beginQuery(identity);
+            activeTools.clear();
+            waitingAt = android.os.SystemClock.elapsedRealtime();
+            activity(VisualState.THINKING, "正在等待模型响应…");
+            save(storedState, "", null, 0);
+            channel.sendUser(text, identity);
+        }
+        synchronized void phoneAction() {
+            metrics.recordPhoneAction(java.util.UUID.randomUUID().toString());
+            save(storedState, "", null, 0);
+        }
+        synchronized void observeEvent(JSONObject event) {
+            if (done) return;
+            if (metrics.observe(event)) save(storedState, "", null, 0);
+            String type = event.optString("type");
+            if ("result".equals(type)) activeTools.clear();
+            if ("system".equals(type) && "api_retry".equals(event.optString("subtype"))) {
+                if (!storedState.equals("running") || cancelled || isSuspended()) return;
+                long now = android.os.SystemClock.elapsedRealtime();
+                retryAttempt = Math.max(1, event.optInt("attempt", 1));
+                int http = event.optInt("error_status"); retryHttp = http >= 400 && http <= 599 ? http : 0;
+                long delay = Math.max(0, Math.min(3600000, event.optLong("retry_delay_ms")));
+                if (waitingAt == 0) waitingAt = now;
+                activityAt = now; lastWaitLogAt = now; retryAt = now + delay;
+                activityPhase = VisualState.RETRYING;
+                activityText = "模型服务异常" + (retryHttp == 0 ? "" : "（HTTP " + retryHttp + "）") + "，第 " + retryAttempt + " 次重试";
+                status = liveStatus();
+                append("【重试】" + status + "；可点月薪喵暂停。");
+                phase(epoch, VisualState.RETRYING, status);
+                return;
+            }
+            JSONObject message = event.optJSONObject("message");
+            JSONArray content = message == null ? null : message.optJSONArray("content");
+            if ("assistant".equals(type) && content != null && (!event.has("error") || event.isNull("error"))) {
+                boolean tool = false;
+                for (int i = 0; i < content.length(); i++) {
+                    JSONObject part = content.optJSONObject(i);
+                    if (part == null || !"tool_use".equals(part.optString("type"))) continue;
+                    String identity = part.optString("id"), name = part.optString("name");
+                    String label = toolLabel(name.startsWith("mcp__phone__") ? name.substring(12) : name);
+                    if (!activeTools.containsKey(identity)) {
+                        activeTools.put(identity, label);
+                        activity(VisualState.ACTING, "正在执行工具：" + label);
+                    }
+                    tool = true;
+                }
+                if (!tool && activeTools.isEmpty()) activity(VisualState.THINKING, "已收到模型响应，正在处理回复…");
+            } else if ("user".equals(type) && content != null) {
+                for (int i = 0; i < content.length(); i++) {
+                    JSONObject part = content.optJSONObject(i);
+                    if (part == null || !"tool_result".equals(part.optString("type"))) continue;
+                    String label = activeTools.remove(part.optString("tool_use_id"));
+                    if (label != null) {
+                        boolean verifiedRoutine = "运行已保存脚本".equals(label) && routineWasVerified(part);
+                        String outcome = verifiedRoutine ? "脚本完成，已验证预期界面。" : label + (part.optBoolean("is_error") ? "报告失败。" : "已返回。");
+                        append("【工具】" + outcome);
+                        if (activeTools.isEmpty()) activity(VisualState.THINKING,
+                                verifiedRoutine ? "脚本已完成验证，正在等待模型整理结果…" : "工具已返回，正在等待模型响应…");
+                    }
+                }
+            } else if ("tool_progress".equals(type)) {
+                String label = activeTools.get(event.optString("tool_use_id"));
+                if (label != null && activityPhase != VisualState.ACTING)
+                    activity(VisualState.ACTING, "正在执行工具：" + label);
+            }
+        }
+        private boolean routineWasVerified(JSONObject result) {
+            if (result.optBoolean("is_error")) return false;
+            try {
+                Object content = result.opt("content");
+                String text = content instanceof String ? (String) content : "";
+                if (content instanceof JSONArray) {
+                    JSONArray blocks = (JSONArray) content;
+                    if (blocks.length() != 1) return false;
+                    text = blocks.getJSONObject(0).optString("text");
+                }
+                if (text.length() > 4096) return false;
+                JSONObject value = new JSONObject(text);
+                return value.optBoolean("ok") && value.optJSONObject("verification") != null;
+            } catch (Exception notRoutineResult) { return false; }
+        }
+        synchronized String liveStatus() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (activityPhase == VisualState.RETRYING) {
+                long seconds = Math.max(0, (retryAt - now + 999) / 1000);
+                return activityText + (seconds > 0 ? "，" + seconds + " 秒后重试" : "，正在重新请求")
+                        + " · 已等待 " + Math.max(0, (now - waitingAt) / 1000) + " 秒";
+            }
+            long seconds = Math.max(0, (now - activityAt) / 1000);
+            return activityText + (seconds >= 5 ? " · 已等待 " + seconds + " 秒" : "");
+        }
+        synchronized void recordLongWait() {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (done || !storedState.equals("running") || now - lastWaitLogAt < 30000) return;
+            lastWaitLogAt = now;
+            append("【等待】" + liveStatus() + "；可暂停后补充或结束任务。");
         }
         synchronized void diagnostic() {
             if (!sawDiagnostic) { sawDiagnostic = true; progress("执行进程返回诊断信息，正在等待最终结果。"); }
@@ -852,39 +1001,39 @@ public final class AgentController {
                     processText = processText.substring(0, processText.length() - finalResult.length() - 2);
             }
             rebuildOutput();
-            save(storedState, "", null, null, 0);
+            save(storedState, "", null, 0);
             output(epoch, transcript);
         }
         synchronized void append(String text) {
             if (done || text == null || text.isEmpty()) return;
             processText = LastTaskStore.tail(processText + (processText.isEmpty() ? "" : "\n\n") + redact(text));
             rebuildOutput();
-            save(storedState, "", null, null, 0);
+            save(storedState, "", null, 0);
             output(epoch, transcript);
         }
         synchronized void hold(String state, String message, JSONObject question) {
             if (done) return;
             storedState = state; status = message; pending = copy(question);
-            save(state, "", null, null, 0);
+            save(state, "", null, 0);
         }
         synchronized void recordAnswer(String answer) {
             interactionAnswer = interactionAnswer + (interactionAnswer.isEmpty() ? "" : "\n\n") + redact(answer);
             if (interactionAnswer.length() > 8000) interactionAnswer = interactionAnswer.substring(interactionAnswer.length() - 8000);
             append("【用户补充】" + answer);
         }
-        synchronized String finish(String state, String message, String reason, String detail, Integer exit, Integer turns) {
+        synchronized String finish(String state, String message, String reason, String detail, Integer exit) {
             done = true;
             pending = null; storedState = state;
             status = message;
             String label = state.equals("success") ? "完成" : state.equals("stopped") ? "已停止" : "未完成";
-            terminalText = redact(LastTaskStore.terminalFooter(label, detail, exit, turns));
+            terminalText = redact(LastTaskStore.terminalFooter(label, detail, exit, null)) + "\n" + metrics.summary();
             rebuildOutput();
             long ended = System.currentTimeMillis();
-            save(state, reason, exit, turns, ended);
+            save(state, reason, exit, ended);
             if (saveFailed) {
                 terminalText += "\n记录暂时无法保存，当前仍可查看。";
                 rebuildOutput();
-                save(state, reason, exit, turns, ended);
+                save(state, reason, exit, ended);
             }
             return transcript;
         }
@@ -897,7 +1046,7 @@ public final class AgentController {
             }
             transcript = LastTaskStore.tail(combined.toString());
         }
-        private void save(String state, String reason, Integer exit, Integer turns, long ended) {
+        private void save(String state, String reason, Integer exit, long ended) {
             saveFailed = false;
             try {
                 JSONObject record = new JSONObject().put("version", 1).put("state", state)
@@ -907,7 +1056,7 @@ public final class AgentController {
                 record.put("pending_question", pending == null ? JSONObject.NULL : new JSONObject(redact(pending.toString())));
                 record.put("interaction_answer", interactionAnswer);
                 if (exit != null) record.put("exit_code", exit);
-                if (turns != null) record.put("num_turns", turns);
+                metrics.writeTo(record);
                 try { taskStore.write(record); } catch (IOException unavailable) { saveFailed = true; }
                 JSONObject turn = new JSONObject(record.toString()).put("id", turnId).put("prompt", prompt)
                         .put("process", processText).put("result", finalResult).put("terminal", terminalText);
@@ -942,7 +1091,7 @@ public final class AgentController {
                 try {
                     if (activeTask == null) activeTask = restoreTask("", "");
                     String transcript = activeTask == null ? lastOutput : activeTask.finish("stopped", "已停止任务，记录已保留。",
-                            "user_stop", "用户手动停止了任务。", null, null);
+                            "user_stop", "用户手动停止了任务。", null);
                     finished(epoch, VisualState.STOPPED, false, "已停止任务，记录已保留。", transcript);
                 } catch (Exception unavailable) {
                     finished(epoch, VisualState.STOPPED, false, "已停止任务，记录暂时无法保存。", lastOutput);
@@ -1021,6 +1170,16 @@ public final class AgentController {
     private static String safeMessage(Exception e) { String m = e.getMessage(); return m == null ? e.getClass().getSimpleName() : m; }
     private static String toolLabel(String name) {
         switch (name) {
+            case "Read": return "读取文件";
+            case "Write": return "写入文件";
+            case "Edit": return "修改文件";
+            case "Glob": return "查找文件";
+            case "Grep": return "搜索文件内容";
+            case "AskUserQuestion": return "等待用户回答";
+            case "list_routines": return "查看已保存脚本";
+            case "save_routine": return "保存已验证脚本";
+            case "run_routine": return "运行已保存脚本";
+            case "open_app_ready": return "打开应用并等待就绪";
             case "read_screen": return "读取界面";
             case "home": return "返回桌面";
             case "back": return "返回";

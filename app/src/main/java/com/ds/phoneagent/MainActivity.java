@@ -3,21 +3,29 @@ package com.ds.phoneagent;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
+import android.view.WindowInsets;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -43,19 +51,27 @@ import javax.crypto.spec.GCMParameterSpec;
 
 /** Minimal, native UI. Runtime internals stay behind the task and setup controls. */
 public final class MainActivity extends Activity {
-    private static final int INK = Color.rgb(27, 46, 37);
-    private static final int MUTED = Color.rgb(100, 118, 108);
-    private static final int GREEN = Color.rgb(23, 106, 85);
+    private static final int BACKGROUND = Color.rgb(251, 246, 238);
+    private static final int INK = Color.rgb(70, 51, 41);
+    private static final int MUTED = Color.rgb(121, 99, 83);
+    private static final int ACCENT = Color.rgb(174, 92, 67);
+    private static final int USER_BUBBLE = Color.rgb(243, 221, 207);
+    private static final int ASSISTANT = Color.rgb(255, 252, 247);
+    private static final int BORDER = Color.rgb(234, 223, 213);
+    private static final int SOFT = Color.rgb(243, 232, 221);
+    private static final int SUCCESS = Color.rgb(88, 112, 40);
+    private static final int ERROR = Color.rgb(151, 67, 45);
     private static final String KEY_ALIAS = "phoneagent.api.key.v1";
     private AgentController controller;
     private SharedPreferences preferences;
-    private TextView state, capabilities;
+    private TextView state, capabilities, connectionStatus;
     private EditText prompt, baseUrl, model, apiKey;
     private Button send, stop, prepare, control, bubble, historyButton, newTaskButton, setupToggle;
     private SwipeDeleteRow revealedRow;
-    private LinearLayout modelFields, setupPanel, historyPanel;
+    private LinearLayout modelFields, setupPanel, historyPanel, composer;
     private String selectedConversationId = "";
     private boolean showHistory = false;
+    private boolean editingConnection;
     private String renderedHistory = "";
     private long historyRenderVersion;
     private int visibleTurnLimit = 10;
@@ -95,6 +111,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedState) {
         super.onCreate(savedState);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         preferences = getSharedPreferences("phoneagent", MODE_PRIVATE);
         controller = AgentController.get(this);
         createUi();
@@ -151,19 +168,39 @@ public final class MainActivity extends Activity {
 
     private void createUi() {
         LinearLayout page = vertical();
-        page.setBackgroundColor(Color.rgb(244, 247, 245));
-        page.setPadding(dp(20), dp(16), dp(20), dp(12));
-        TextView title = text("PhoneAgent", 28, INK);
+        page.setFocusableInTouchMode(true);
+        page.setBackgroundColor(BACKGROUND);
+        page.setPadding(dp(16), dp(10), dp(16), dp(10));
+
+        LinearLayout header = horizontal();
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout brand = vertical();
+        TextView title = text("月薪喵", 28, INK);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        page.addView(title);
-        TextView subtitle = text("月薪喵 · 让手机替你动手", 14, MUTED);
-        subtitle.setPadding(0, dp(4), 0, dp(16));
-        page.addView(subtitle);
+        brand.addView(title);
+        TextView subtitle = text("PhoneAgent · 让手机替你动手", 12, MUTED);
+        subtitle.setPadding(0, dp(2), 0, dp(4));
+        brand.addView(subtitle);
+        state = text("先准备环境，再开启手机控制", 12, MUTED);
+        state.setMaxLines(2);
+        state.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        state.setLineSpacing(dp(2), 1);
+        brand.addView(state);
+        header.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
+        statePet = new MonthlyCatView(this);
+        statePet.setState(controller.getVisualState());
+        LinearLayout.LayoutParams petSize = new LinearLayout.LayoutParams(dp(72), dp(84));
+        petSize.leftMargin = dp(10);
+        header.addView(statePet, petSize);
+        LinearLayout.LayoutParams headerSize = new LinearLayout.LayoutParams(-1, -2);
+        headerSize.bottomMargin = dp(10);
+        page.addView(header, headerSize);
 
         LinearLayout navigation = horizontal();
         historyButton = button("任务记录", false);
         historyButton.setContentDescription("打开最近任务");
         newTaskButton = button("＋ 新任务", true);
+        newTaskButton.setContentDescription("新任务");
         navigation.addView(newTaskButton, weighted());
         navigation.addView(historyButton, weighted());
         page.addView(navigation);
@@ -173,15 +210,25 @@ public final class MainActivity extends Activity {
             contentScroll.scrollTo(0, 0);
         });
 
-        setupToggle = button("连接与设置  ›", false);
+        LinearLayout connectionRow = horizontal();
+        connectionRow.setGravity(Gravity.CENTER_VERTICAL);
+        connectionStatus = text("● 待配置", 13, MUTED);
+        connectionStatus.setPadding(dp(4), dp(8), dp(10), dp(8));
+        connectionRow.addView(connectionStatus, new LinearLayout.LayoutParams(-2, -2));
+        View separator = new View(this);
+        separator.setBackgroundColor(BORDER);
+        connectionRow.addView(separator, new LinearLayout.LayoutParams(dp(1), dp(20)));
+        setupToggle = plainButton("连接与设置  ›");
+        setupToggle.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         setupToggle.setContentDescription("连接与设置");
-        LinearLayout.LayoutParams setupToggleSize = new LinearLayout.LayoutParams(-1, dp(40));
-        setupToggleSize.topMargin = dp(5); setupToggleSize.bottomMargin = dp(8);
-        page.addView(setupToggle, setupToggleSize);
+        connectionRow.addView(setupToggle, new LinearLayout.LayoutParams(0, -2, 1));
+        page.addView(connectionRow, new LinearLayout.LayoutParams(-1, -2));
+        page.addView(divider(), new LinearLayout.LayoutParams(-1, dp(1)));
 
         contentScroll = new ScrollView(this);
         contentScroll.setFillViewport(false);
         contentScroll.setClipToPadding(false);
+        contentScroll.setPadding(0, dp(12), 0, dp(8));
         page.addView(contentScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout content = vertical();
         contentScroll.addView(content);
@@ -194,23 +241,13 @@ public final class MainActivity extends Activity {
             setupToggle.setText(opening ? "连接与设置  ∧" : "连接与设置  ›");
             if (opening) contentScroll.post(() -> contentScroll.smoothScrollTo(0, 0));
         });
-
         historyPanel = vertical();
         content.addView(historyPanel);
+
         LinearLayout setup = card();
-        LinearLayout statusRow = horizontal();
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
-        statePet = new MonthlyCatView(this);
-        statePet.setState(controller.getVisualState());
-        LinearLayout.LayoutParams petSize = new LinearLayout.LayoutParams(dp(72), dp(84));
-        petSize.rightMargin = dp(12);
-        statusRow.addView(statePet, petSize);
-        state = text("先准备环境，再开启手机控制", 15, INK);
-        state.setTypeface(Typeface.DEFAULT_BOLD);
-        statusRow.addView(state, new LinearLayout.LayoutParams(0, -2, 1));
-        LinearLayout statusCard = card();
-        statusCard.addView(statusRow);
-        content.addView(statusCard, 1, spaced());
+        TextView setupTitle = text("手机控制", 16, INK);
+        setupTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        setup.addView(setupTitle);
         capabilities = text("", 12, MUTED);
         capabilities.setPadding(0, dp(7), 0, dp(8));
         setup.addView(capabilities);
@@ -221,17 +258,12 @@ public final class MainActivity extends Activity {
         setupRow.addView(control, weighted());
         setup.addView(setupRow);
         bubble = button("开启悬浮球", false);
-        setup.addView(bubble, new LinearLayout.LayoutParams(-1, dp(46)));
+        setup.addView(bubble, new LinearLayout.LayoutParams(-1, -2));
         setupPanel.addView(setup, spaced());
-
         prepare.setOnClickListener(view -> {
-            hideKeyboard();
-            controller.installRuntime();
-            refreshState();
+            hideKeyboard(); controller.installRuntime(); refreshState();
         });
-        control.setOnClickListener(view -> {
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-        });
+        control.setOnClickListener(view -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         bubble.setOnClickListener(view -> {
             if (!Settings.canDrawOverlays(this) && !PhoneAccessibilityService.isEnabled()) {
                 startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
@@ -244,9 +276,10 @@ public final class MainActivity extends Activity {
         });
 
         LinearLayout modelCard = card();
-        Button settings = button("连接模型  ›", false);
-        settings.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
-        modelCard.addView(settings, new LinearLayout.LayoutParams(-1, dp(42)));
+        Button settings = plainButton("连接模型  ›");
+        settings.setTypeface(Typeface.DEFAULT_BOLD);
+        settings.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        modelCard.addView(settings, new LinearLayout.LayoutParams(-1, -2));
         modelFields = vertical();
         modelCard.addView(modelFields);
         TextView help = text("填写兼容 Anthropic API 的服务地址与模型。密钥加密保存在本机。", 12, MUTED);
@@ -256,44 +289,84 @@ public final class MainActivity extends Activity {
         model = field("模型", "输入服务商的模型名称", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, modelFields);
         apiKey = field("API Key", "输入密钥", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD, modelFields);
         apiKey.setSaveEnabled(false);
-        Button save = button("保存连接配置", false);
-        modelFields.addView(save, new LinearLayout.LayoutParams(-1, dp(46)));
+        Button save = button("保存连接配置", true);
+        modelFields.addView(save, new LinearLayout.LayoutParams(-1, -2));
         save.setOnClickListener(view -> {
-            saveSettings();
-            hideKeyboard();
-            modelFields.setVisibility(View.GONE);
+            saveSettings(); hideKeyboard(); modelFields.setVisibility(View.GONE); refreshState();
         });
-        settings.setOnClickListener(view -> modelFields.setVisibility(modelFields.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
+        settings.setOnClickListener(view -> {
+            boolean opening = modelFields.getVisibility() != View.VISIBLE;
+            if (!opening) hideKeyboard();
+            modelFields.setVisibility(opening ? View.VISIBLE : View.GONE);
+        });
         setupPanel.addView(modelCard, spaced());
 
-        LinearLayout composer = vertical();
-        composer.setPadding(0, dp(12), 0, 0);
+        composer = vertical();
+        composer.setPadding(0, dp(10), 0, 0);
+        composer.addView(divider(), new LinearLayout.LayoutParams(-1, dp(1)));
         prompt = new EditText(this);
-        prompt.setHint("例如：打开系统设置");
+        prompt.setHint("想让月薪喵做什么？");
+        prompt.setContentDescription("任务输入");
         prompt.setTextSize(16);
         prompt.setTextColor(INK);
         prompt.setHintTextColor(MUTED);
         prompt.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-        prompt.setMinLines(2);
-        prompt.setMaxLines(4);
-        prompt.setGravity(Gravity.TOP | Gravity.LEFT);
+        prompt.setMinLines(1);
+        prompt.setMaxLines(3);
+        prompt.setMinHeight(dp(52));
+        prompt.setGravity(Gravity.TOP | Gravity.START);
         prompt.setPadding(dp(14), dp(12), dp(14), dp(12));
-        prompt.setBackground(shape(Color.WHITE, Color.rgb(211, 223, 216), 14));
-        composer.addView(prompt, new LinearLayout.LayoutParams(-1, -2));
+        prompt.setBackground(shape(ASSISTANT, BORDER, 16));
+        LinearLayout.LayoutParams promptSize = new LinearLayout.LayoutParams(-1, -2);
+        promptSize.topMargin = dp(10);
+        composer.addView(prompt, promptSize);
         LinearLayout actions = horizontal();
-        actions.setPadding(0, dp(6), 0, 0);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+        actions.setPadding(0, dp(7), 0, 0);
         send = button("开始执行", true);
-        stop = button("停止", false);
-        actions.addView(send, new LinearLayout.LayoutParams(0, dp(50), 3));
-        LinearLayout.LayoutParams stopSize = new LinearLayout.LayoutParams(0, dp(50), 1);
+        send.setContentDescription("开始执行");
+        stop = plainButton("停止");
+        actions.addView(send, new LinearLayout.LayoutParams(0, -2, 3));
+        LinearLayout.LayoutParams stopSize = new LinearLayout.LayoutParams(0, -2, 1);
         stopSize.leftMargin = dp(8);
         actions.addView(stop, stopSize);
         composer.addView(actions);
-        TextView tip = text("执行时会回到手机界面，点悬浮球查看进度或停止。", 11, MUTED);
-        tip.setPadding(0, dp(7), 0, 0);
-        composer.addView(tip);
         page.addView(composer);
         setContentView(page);
+        page.requestFocus();
+        final boolean[] keyboardShown = {false};
+        final Rect visibleWindow = new Rect();
+        page.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            boolean keyboard;
+            if (Build.VERSION.SDK_INT >= 30) {
+                WindowInsets insets = page.getRootWindowInsets();
+                keyboard = insets != null && insets.isVisible(WindowInsets.Type.ime());
+            } else {
+                page.getWindowVisibleDisplayFrame(visibleWindow);
+                keyboard = page.getRootView().getHeight() - visibleWindow.bottom > dp(120);
+            }
+            if (keyboard != keyboardShown[0]) {
+                keyboardShown[0] = keyboard;
+                subtitle.setVisibility(keyboard ? View.GONE : View.VISIBLE);
+                state.setVisibility(keyboard ? View.GONE : View.VISIBLE);
+                LinearLayout.LayoutParams pet = (LinearLayout.LayoutParams) statePet.getLayoutParams();
+                pet.width = dp(keyboard ? 48 : 72); pet.height = dp(keyboard ? 58 : 84);
+                statePet.setLayoutParams(pet);
+            }
+            int headerVisibility = page.getHeight() > 0 && page.getHeight() < dp(400) ? View.GONE : View.VISIBLE;
+            if (header.getVisibility() != headerVisibility) header.setVisibility(headerVisibility);
+            // A focused settings field retains focus after Back closes the IME, so track the IME too.
+            boolean editingSettings = baseUrl.hasFocus() || model.hasFocus() || apiKey.hasFocus();
+            boolean editing = keyboard && editingSettings;
+            if (editing != editingConnection) {
+                editingConnection = editing;
+                prompt.setVisibility(editing ? View.GONE : View.VISIBLE);
+                // Keep Stop available while an active task's connection settings are being edited.
+                refreshState();
+            }
+        });
+        for (EditText field : new EditText[]{baseUrl, model, apiKey})
+            field.setOnFocusChangeListener((view, focused) -> page.post(page::requestLayout));
         send.setOnClickListener(view -> submit());
         stop.setOnClickListener(view -> {
             if (controller.isRunning()) controller.stop();
@@ -312,7 +385,9 @@ public final class MainActivity extends Activity {
         if (!PhoneAccessibilityService.isEnabled()) { toast("请先开启 PhoneAgent 手机控制"); return; }
         if (endpoint.isEmpty() || chosenModel.isEmpty() || secret.isEmpty()) {
             setupPanel.setVisibility(View.VISIBLE);
+            setupToggle.setText("连接与设置  ∧");
             modelFields.setVisibility(View.VISIBLE);
+            contentScroll.post(() -> contentScroll.smoothScrollTo(0, 0));
             toast("请填写模型服务地址、模型名称和 API Key");
             return;
         }
@@ -357,6 +432,11 @@ public final class MainActivity extends Activity {
         capabilities.setText((ready ? "环境已就绪" : "环境待准备") + "  ·  "
                 + (accessible ? "手机控制已开启" : "手机控制未开启") + "  ·  "
                 + (overlay ? "悬浮球可用" : "悬浮球待授权"));
+        boolean configured = baseUrl.length() > 0 && model.length() > 0 && apiKey.length() > 0;
+        connectionStatus.setText(ready && accessible && configured ? "● 已就绪" : "● 待配置");
+        connectionStatus.setTextColor(ready && accessible && configured ? SUCCESS : MUTED);
+        connectionStatus.setContentDescription(ready && accessible && configured
+                ? "运行环境、手机控制与模型配置已就绪" : "手机控制或模型连接待配置");
         prepare.setText(ready ? "环境已就绪" : "准备环境");
         prepare.setEnabled(!running && !ready);
         control.setText(accessible ? "手机控制设置" : "开启手机控制");
@@ -365,13 +445,15 @@ public final class MainActivity extends Activity {
         JSONObject selected = continuing ? controller.getConversation(selectedConversationId) : null;
         boolean canContinue = selected != null && selected.optBoolean("can_continue");
         send.setText(continuing ? "继续对话" : "开始执行");
-        send.setEnabled(!running && (!continuing || canContinue));
-        prompt.setHint(continuing ? "继续追问，或让月薪喵接着操作…" : "例如：打开大麦，看看北京的演唱会");
+        send.setContentDescription(continuing ? "继续对话" : "开始执行");
+        send.setEnabled(!editingConnection && !running && (!continuing || canContinue));
+        prompt.setHint(continuing ? "接下来，还想让我做什么？" : "想让月薪喵做什么？");
         stop.setText(running ? "停止" : "重置");
+        stop.setContentDescription(running ? "停止任务" : "重置为待命");
         stop.setEnabled(running || controller.canResetToIdle());
         historyButton.setSelected(showHistory);
-        historyButton.setTextColor(showHistory ? Color.WHITE : GREEN);
-        historyButton.setBackground(shape(showHistory ? GREEN : Color.rgb(235, 244, 239), Color.TRANSPARENT, 11));
+        styleButton(historyButton, showHistory);
+        styleButton(newTaskButton, !showHistory);
         newTaskButton.setSelected(!showHistory && selectedConversationId.isEmpty());
     }
 
@@ -410,15 +492,17 @@ public final class MainActivity extends Activity {
                 final String id = entry.optString("id");
                 LinearLayout item = card();
                 TextView title = text(entry.optString("title", "手机任务"), 17, INK);
-                title.setTypeface(Typeface.DEFAULT_BOLD); title.setMaxLines(2); item.addView(title);
+                title.setTypeface(Typeface.DEFAULT_BOLD); title.setMaxLines(2);
+                title.setEllipsize(TextUtils.TruncateAt.END); item.addView(title);
                 TextView meta = text(date(entry.optLong("updated_at")) + "  ·  " + stateLabel(entry.optString("status"))
                         + "  ·  " + entry.optInt("turn_count", 1) + " 轮对话", 12, MUTED);
                 meta.setPadding(0, dp(7), 0, dp(8)); item.addView(meta);
                 String preview = entry.optString("last_result").replaceAll("[\\r\\n]+", " ");
                 if (!preview.isEmpty()) {
-                    TextView excerpt = text(preview, 14, MUTED); excerpt.setMaxLines(2); item.addView(excerpt);
+                    TextView excerpt = text(preview, 14, MUTED); excerpt.setMaxLines(2);
+                    excerpt.setEllipsize(TextUtils.TruncateAt.END); item.addView(excerpt);
                 }
-                TextView open = text("查看结果与过程  ›", 13, GREEN); open.setPadding(0, dp(9), 0, 0); item.addView(open);
+                TextView open = text("查看对话  ›", 13, ACCENT); open.setPadding(0, dp(9), 0, 0); item.addView(open);
                 item.setContentDescription(entry.optString("title") + "，" + stateLabel(entry.optString("status")) + "，查看任务");
                 SwipeDeleteRow row = new SwipeDeleteRow(this, item, () -> openConversation(id), () -> deleteConversation(id));
                 row.setTag(id);
@@ -431,14 +515,11 @@ public final class MainActivity extends Activity {
             }
         } else if (detail == null) {
             LinearLayout empty = card();
-            TextView heading = text(selectedConversationId.isEmpty() ? "想让月薪喵做什么？" : "这段对话已不在近期记录中", 18, INK);
+            TextView heading = text(selectedConversationId.isEmpty() ? "你好，我是月薪喵。" : "这段对话已不在近期记录中", 18, INK);
             heading.setTypeface(Typeface.DEFAULT_BOLD); empty.addView(heading);
-            TextView help = text(selectedConversationId.isEmpty() ? "在下方输入任务，完成后可以继续追问。" : "点“新任务”开始一段新对话。", 14, MUTED);
+            TextView help = text(selectedConversationId.isEmpty() ? "在下方输入任务，完成后可以继续追问。需要配置时，打开上方“连接与设置”。" : "点“新任务”开始一段新对话。", 14, MUTED);
             help.setPadding(0, dp(10), 0, 0); empty.addView(help); historyPanel.addView(empty, spaced());
         } else {
-            TextView heading = text(detail.optString("title", "手机任务"), 20, INK);
-            heading.setTypeface(Typeface.DEFAULT_BOLD); heading.setPadding(0, dp(2), 0, dp(12));
-            historyPanel.addView(heading);
             JSONArray turns = detail.optJSONArray("turns");
             if (turns != null) {
                 int start = Math.max(0, turns.length() - visibleTurnLimit);
@@ -454,7 +535,7 @@ public final class MainActivity extends Activity {
             }
             if (selectedConversationId.equals(unsavedConversationId) && !unsavedOutput.isEmpty()) {
                 LinearLayout fallback = card();
-                TextView label = text("本轮记录暂未保存 · 请先复制", 14, GREEN);
+                TextView label = text("本轮记录暂未保存 · 请先复制", 14, ERROR);
                 label.setTypeface(Typeface.DEFAULT_BOLD); fallback.addView(label);
                 TextView available = text(unsavedOutput, 14, INK);
                 available.setTextIsSelectable(true); available.setPadding(0, dp(10), 0, 0);
@@ -516,35 +597,50 @@ public final class MainActivity extends Activity {
     }
 
     private void addTurn(JSONObject turn, int number) {
-        LinearLayout item = card();
-        TextView meta = text("对话 " + number + "  ·  " + date(turn.optLong("started_at")) + "  ·  " + stateLabel(turn.optString("state")), 12, MUTED);
-        item.addView(meta);
-        TextView request = text(turn.optString("prompt", "旧版任务"), 16, INK);
-        request.setTypeface(Typeface.DEFAULT_BOLD); request.setTextIsSelectable(true);
-        request.setPadding(0, dp(10), 0, dp(12)); item.addView(request);
-        String result = turn.optString("result");
-        if (!result.isEmpty()) {
-            TextView label = text("最终结果", 13, GREEN); label.setTypeface(Typeface.DEFAULT_BOLD); item.addView(label);
-            MarkdownView rich = new MarkdownView(this); rich.setMarkdown(result);
-            rich.setPadding(0, dp(8), 0, dp(6)); item.addView(rich);
-            Button copy = button("复制结果", false);
-            copy.setOnClickListener(view -> {
-                ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                clipboard.setPrimaryClip(ClipData.newPlainText("任务结果", result)); toast("已复制 Markdown 结果");
-            });
-            item.addView(copy, new LinearLayout.LayoutParams(-1, dp(40)));
-        } else {
-            TextView pending = text("running".equals(turn.optString("state"))
-                    ? "月薪喵正在处理，完成后结果会显示在这里。" : "这轮没有生成最终结果，可查看执行过程与结束原因。", 14, MUTED);
-            pending.setPadding(0, dp(4), 0, dp(10)); item.addView(pending);
-        }
+        String turnState = turn.optString("state");
+        TextView timestamp = text(messageDate(turn.optLong("started_at")), 12, MUTED);
+        timestamp.setGravity(Gravity.CENTER);
+        timestamp.setPadding(0, dp(8), 0, dp(14));
+        historyPanel.addView(timestamp, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView request = text(turn.optString("prompt", "旧版任务"), 17, INK);
+        request.setTextIsSelectable(true);
+        request.setLineSpacing(dp(3), 1);
+        request.setPadding(dp(15), dp(12), dp(15), dp(12));
+        request.setBackground(shape(USER_BUBBLE, Color.TRANSPARENT, 20));
+        addAligned(request, 0.86f, true, 0, 14);
+
+        LinearLayout sender = horizontal();
+        sender.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView avatar = new ImageView(this);
+        avatar.setImageResource(R.drawable.monthly_cat_icon);
+        avatar.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        avatar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams avatarSize = new LinearLayout.LayoutParams(dp(34), dp(38));
+        avatarSize.rightMargin = dp(7);
+        sender.addView(avatar, avatarSize);
+        TextView name = text("月薪喵", 16, INK);
+        name.setTypeface(Typeface.DEFAULT_BOLD);
+        sender.addView(name, new LinearLayout.LayoutParams(-2, -2));
+        TextView badge = text(("success".equals(turnState) ? "✓ " : "") + stateLabel(turnState), 12, stateColor(turnState));
+        badge.setPadding(dp(8), dp(4), dp(8), dp(4));
+        badge.setBackground(shape(stateFill(turnState), Color.TRANSPARENT, 12));
+        LinearLayout.LayoutParams badgeSize = new LinearLayout.LayoutParams(-2, -2);
+        badgeSize.leftMargin = dp(9);
+        sender.addView(badge, badgeSize);
+        addAligned(sender, 0.94f, false, 0, 7);
+
+        LinearLayout response = vertical();
+        response.setPadding(dp(12), dp(12), dp(12), dp(10));
+        response.setBackground(shape(ASSISTANT, BORDER, 18));
         String process = turn.optString("process");
         final String turnId = turn.optString("id", selectedConversationId + "-" + number);
         boolean expanded = expandedProcesses.contains(turnId);
-        Button processButton = button((expanded ? "收起执行过程  ∧" : "展开执行过程  ∨"), false);
+        Button processButton = button("执行过程 · " + stateLabel(turnState) + (expanded ? "  ∧" : "  ›"), false);
+        processButton.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        processButton.setTextSize(14);
         processButton.setContentDescription(expanded ? "收起执行过程" : "展开执行过程");
-        LinearLayout.LayoutParams processSize = new LinearLayout.LayoutParams(-1, dp(42)); processSize.topMargin = dp(10);
-        item.addView(processButton, processSize);
+        response.addView(processButton, new LinearLayout.LayoutParams(-1, -2));
         processButton.setOnClickListener(view -> {
             if (!expandedProcesses.add(turnId)) expandedProcesses.remove(turnId);
             renderHistory(true);
@@ -552,17 +648,82 @@ public final class MainActivity extends Activity {
         if (expanded) {
             TextView steps = text(process.isEmpty() ? "暂无可显示的执行过程。" : process, 13, MUTED);
             steps.setTextIsSelectable(true); steps.setLineSpacing(dp(3), 1);
-            steps.setPadding(0, dp(10), 0, dp(8)); item.addView(steps);
+            steps.setPadding(dp(2), dp(10), dp(2), dp(4)); response.addView(steps);
+        }
+        LinearLayout.LayoutParams lineSize = new LinearLayout.LayoutParams(-1, dp(1));
+        lineSize.topMargin = dp(10); lineSize.bottomMargin = dp(10);
+        response.addView(divider(), lineSize);
+        String result = turn.optString("result");
+        if (!result.isEmpty()) {
+            MarkdownView rich = new MarkdownView(this);
+            rich.setMarkdown(result);
+            response.addView(rich, new LinearLayout.LayoutParams(-1, -2));
+        } else {
+            String pending;
+            switch (turnState) {
+                case "running": pending = "月薪喵正在处理，最终结果会显示在这里。"; break;
+                case "stopped": pending = "这轮已停止，尚未生成最终结果。"; break;
+                case "interrupted": pending = "这轮被中断，尚未收到最终结果。"; break;
+                case "success": pending = "任务已结束，但没有返回结果正文。"; break;
+                default: pending = "这轮没有生成最终结果，可查看执行过程与结束原因。";
+            }
+            TextView message = text(pending, 15, MUTED);
+            message.setLineSpacing(dp(3), 1);
+            message.setPadding(dp(2), dp(2), dp(2), dp(6)); response.addView(message);
         }
         String terminal = turn.optString("terminal");
         if (!terminal.isEmpty()) {
             TextView footer = text(terminal.replace("【任务结束】\n", ""), 12, MUTED);
-            footer.setTextIsSelectable(true); footer.setPadding(0, dp(12), 0, 0); item.addView(footer);
-        } else if ("running".equals(turn.optString("state"))) {
-            TextView status = text(turn.optString("status", "任务进行中…"), 12, GREEN);
-            status.setPadding(0, dp(12), 0, 0); item.addView(status);
+            footer.setTextIsSelectable(true); footer.setLineSpacing(dp(2), 1);
+            footer.setPadding(dp(2), dp(12), dp(2), dp(2)); response.addView(footer);
+        } else if ("running".equals(turnState)) {
+            TextView status = text(turn.optString("status", "任务进行中…"), 12, ACCENT);
+            status.setPadding(dp(2), dp(10), dp(2), dp(2)); response.addView(status);
         }
-        historyPanel.addView(item, spaced());
+        if (!result.isEmpty()) {
+            LinearLayout copyRow = horizontal();
+            copyRow.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            Button copy = plainButton("复制结果");
+            copy.setTextSize(13);
+            copy.setContentDescription("复制结果");
+            copy.setOnClickListener(view -> {
+                ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                clipboard.setPrimaryClip(ClipData.newPlainText("任务结果", result)); toast("已复制 Markdown 结果");
+            });
+            copyRow.addView(copy, new LinearLayout.LayoutParams(-2, -2));
+            response.addView(copyRow, new LinearLayout.LayoutParams(-1, -2));
+        }
+        addAligned(response, 0.94f, false, 0, 22);
+    }
+
+    /** Weight-based bubbles stay proportional after rotation and with larger system text. */
+    private void addAligned(View bubble, float fraction, boolean right, int top, int bottom) {
+        LinearLayout row = horizontal();
+        View gutter = new View(this);
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(0, 0, 1 - fraction);
+        LinearLayout.LayoutParams body = new LinearLayout.LayoutParams(0, -2, fraction);
+        if (right) { row.addView(gutter, gap); row.addView(bubble, body); }
+        else { row.addView(bubble, body); row.addView(gutter, gap); }
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(-1, -2);
+        size.topMargin = dp(top); size.bottomMargin = dp(bottom);
+        historyPanel.addView(row, size);
+    }
+
+    private int stateColor(String state) {
+        if ("success".equals(state)) return SUCCESS;
+        if ("error".equals(state) || "interrupted".equals(state)) return ERROR;
+        return "running".equals(state) ? ACCENT : MUTED;
+    }
+    private int stateFill(String state) {
+        if ("success".equals(state)) return Color.rgb(237, 239, 216);
+        if ("error".equals(state) || "interrupted".equals(state)) return Color.rgb(249, 230, 218);
+        return SOFT;
+    }
+    private String messageDate(long time) {
+        if (time <= 0) return "历史对话";
+        SimpleDateFormat day = new SimpleDateFormat("yyyyMMdd", Locale.CHINA);
+        String date = day.format(new Date(time)).equals(day.format(new Date())) ? "今天" : new SimpleDateFormat("MM-dd", Locale.CHINA).format(new Date(time));
+        return date + " · " + new SimpleDateFormat("HH:mm", Locale.CHINA).format(new Date(time));
     }
 
     private String date(long time) {
@@ -628,29 +789,57 @@ public final class MainActivity extends Activity {
     private void hideKeyboard() {
         InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         keyboard.hideSoftInputFromWindow(prompt.getWindowToken(), 0);
+        View focused = getCurrentFocus();
+        if (focused != null) focused.clearFocus();
         prompt.clearFocus();
+        if (composer != null) composer.setVisibility(View.VISIBLE);
     }
     private LinearLayout vertical() { LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL); return layout; }
     private LinearLayout horizontal() { LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.HORIZONTAL); return layout; }
     private TextView text(String value, int size, int color) { TextView text = new TextView(this); text.setText(value); text.setTextSize(size); text.setTextColor(color); return text; }
     private LinearLayout card() {
-        LinearLayout layout = vertical(); layout.setPadding(dp(16), dp(14), dp(16), dp(14));
-        layout.setBackground(shape(Color.WHITE, Color.rgb(225, 233, 228), 18)); return layout;
+        LinearLayout layout = vertical(); layout.setPadding(dp(14), dp(13), dp(14), dp(13));
+        layout.setBackground(shape(ASSISTANT, BORDER, 17)); return layout;
     }
     private Button button(String label, boolean primary) {
-        Button button = new Button(this); button.setText(label); button.setAllCaps(false); button.setTextSize(14);
-        button.setTextColor(primary ? Color.WHITE : GREEN); button.setMinHeight(0); button.setMinimumHeight(0);
-        button.setPadding(dp(10), dp(8), dp(10), dp(8));
-        button.setBackground(shape(primary ? GREEN : Color.rgb(235, 244, 239), Color.TRANSPARENT, 11));
+        Button button = new Button(this);
+        button.setText(label); button.setAllCaps(false); button.setSingleLine(false); button.setTextSize(16);
+        button.setMinWidth(0); button.setMinimumWidth(0);
+        button.setMinHeight(dp(48)); button.setMinimumHeight(dp(48));
+        button.setPadding(dp(12), dp(10), dp(12), dp(10));
+        button.setStateListAnimator(null); button.setElevation(0); button.setTranslationZ(0);
+        styleButton(button, primary);
         return button;
+    }
+    private void styleButton(Button button, boolean primary) {
+        int disabledFill = primary ? Color.rgb(219, 202, 188) : Color.rgb(239, 230, 220);
+        StateListDrawable backgrounds = new StateListDrawable();
+        backgrounds.addState(new int[]{-android.R.attr.state_enabled}, shape(disabledFill, Color.TRANSPARENT, 13));
+        backgrounds.addState(new int[]{android.R.attr.state_pressed}, shape(primary ? Color.rgb(145, 71, 49) : Color.rgb(230, 211, 195), Color.TRANSPARENT, 13));
+        backgrounds.addState(new int[]{}, shape(primary ? ACCENT : SOFT, Color.TRANSPARENT, 13));
+        button.setBackground(backgrounds);
+        button.setTextColor(new ColorStateList(new int[][]{new int[]{-android.R.attr.state_enabled}, new int[]{}},
+                new int[]{Color.rgb(132, 113, 98), primary ? Color.WHITE : INK}));
+    }
+    private Button plainButton(String label) {
+        Button button = button(label, false);
+        StateListDrawable backgrounds = new StateListDrawable();
+        backgrounds.addState(new int[]{android.R.attr.state_pressed}, shape(SOFT, Color.TRANSPARENT, 12));
+        backgrounds.addState(new int[]{}, shape(Color.TRANSPARENT, Color.TRANSPARENT, 12));
+        button.setBackground(backgrounds);
+        return button;
+    }
+    private View divider() {
+        View line = new View(this); line.setBackgroundColor(BORDER); return line;
     }
     private EditText field(String label, String hint, int inputType, LinearLayout parent) {
         TextView name = text(label, 12, MUTED); name.setPadding(0, dp(7), 0, dp(3)); parent.addView(name);
         EditText value = new EditText(this); value.setTextSize(14); value.setTextColor(INK); value.setHint(hint);
-        value.setHintTextColor(Color.rgb(145, 155, 149)); value.setInputType(inputType); value.setSingleLine(true);
+        value.setHintTextColor(MUTED); value.setInputType(inputType); value.setSingleLine(true);
+        value.setContentDescription(label); value.setMinHeight(dp(48));
         value.setPadding(dp(10), dp(10), dp(10), dp(10));
-        value.setBackground(shape(Color.rgb(248, 250, 249), Color.rgb(222, 231, 225), 8));
-        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(-1, dp(46)); size.bottomMargin = dp(7);
+        value.setBackground(shape(BACKGROUND, BORDER, 10));
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(-1, -2); size.bottomMargin = dp(7);
         parent.addView(value, size); return value;
     }
     private GradientDrawable shape(int fill, int stroke, int radius) {
@@ -658,8 +847,8 @@ public final class MainActivity extends Activity {
         if (stroke != Color.TRANSPARENT) shape.setStroke(dp(1), stroke); return shape;
     }
     private LinearLayout.LayoutParams weighted() {
-        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(44), 1);
-        size.setMargins(dp(2), dp(4), dp(2), dp(6)); return size;
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, -2, 1);
+        size.setMargins(dp(3), dp(3), dp(3), dp(5)); return size;
     }
     private LinearLayout.LayoutParams spaced() {
         LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(-1, -2); size.bottomMargin = dp(12); return size;

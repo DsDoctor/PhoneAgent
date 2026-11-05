@@ -34,11 +34,12 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** Native, selectable Markdown. Never loads HTML, scripts, images or remote resources. */
 public final class MarkdownView extends LinearLayout {
-    private static final int INK = Color.rgb(27, 46, 37);
-    private static final int MUTED = Color.rgb(100, 118, 108);
-    private static final int GREEN = Color.rgb(23, 106, 85);
-    private static final int BORDER = Color.rgb(215, 226, 220);
-    private static final int CODE = Color.rgb(239, 244, 240);
+    private static final int INK = Color.rgb(70, 51, 41);
+    private static final int MUTED = Color.rgb(121, 99, 83);
+    private static final int ACCENT = Color.rgb(174, 92, 67);
+    private static final int BORDER = Color.rgb(225, 208, 195);
+    private static final int CODE = Color.rgb(245, 237, 229);
+    private static final int TABLE_HEADER = Color.rgb(244, 232, 221);
     // A table can otherwise multiply a short Markdown result into thousands of Views.
     private static final int MAX_TABLE_CELLS = 192;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -91,7 +92,7 @@ public final class MarkdownView extends LinearLayout {
                     row.setGravity(Gravity.TOP);
                     row.setPadding(dp(block.indent * 14), 0, 0, 0);
                     TextView marker = text(block.marker, false);
-                    marker.setTextColor(GREEN);
+                    marker.setTextColor(ACCENT);
                     marker.setMinWidth(dp(22));
                     marker.setPadding(0, 0, dp(7), 0);
                     marker.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -108,7 +109,7 @@ public final class MarkdownView extends LinearLayout {
                     TextView value = text(block.text, true);
                     value.setTextColor(MUTED);
                     value.setPadding(dp(11), dp(7), dp(9), dp(7));
-                    value.setBackgroundColor(Color.rgb(247, 249, 247));
+                    value.setBackgroundColor(CODE);
                     quote.addView(value, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
                     add(quote, 2, 9); break;
                 }
@@ -139,7 +140,7 @@ public final class MarkdownView extends LinearLayout {
         TextView value = new TextView(getContext());
         value.setTextSize(15);
         value.setTextColor(INK);
-        value.setLinkTextColor(GREEN);
+        value.setLinkTextColor(ACCENT);
         value.setIncludeFontPadding(false);
         value.setLineSpacing(dp(3), 1.08f);
         value.setTextIsSelectable(true);
@@ -196,13 +197,18 @@ public final class MarkdownView extends LinearLayout {
                 cell.setTextSize(14);
                 cell.setMinWidth(dp(86)); cell.setMaxWidth(dp(240));
                 cell.setPadding(dp(10), dp(9), dp(10), dp(9));
-                cell.setBackground(background(rowIndex == 0 ? CODE : Color.WHITE, true));
+                cell.setBackgroundColor(rowIndex == 0 ? TABLE_HEADER : Color.TRANSPARENT);
                 if (rowIndex == 0) cell.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
                 int align = block.alignments.get(column);
                 cell.setGravity(Gravity.TOP | (align == 0 ? Gravity.CENTER_HORIZONTAL : align == 1 ? Gravity.RIGHT : Gravity.LEFT));
                 row.addView(cell, new TableRow.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT));
             }
             table.addView(row, new TableLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+            if (rowIndex > 0) {
+                View divider = new View(getContext());
+                divider.setBackgroundColor(BORDER);
+                table.addView(divider, new TableLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(1)));
+            }
         }
         scroll.addView(table, new HorizontalScrollView.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
         return scroll;
@@ -258,6 +264,6 @@ public final class MarkdownView extends LinearLayout {
                 Toast.makeText(widget.getContext(), "暂时无法打开链接", Toast.LENGTH_SHORT).show();
             }
         }
-        @Override public void updateDrawState(TextPaint ds) { super.updateDrawState(ds); ds.setColor(GREEN); ds.setUnderlineText(true); }
+        @Override public void updateDrawState(TextPaint ds) { super.updateDrawState(ds); ds.setColor(ACCENT); ds.setUnderlineText(true); }
     }
 }

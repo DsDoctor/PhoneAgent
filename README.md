@@ -1,6 +1,6 @@
 # PhoneAgent
 
-运行在 Android 手机上的轻量 Agent 原型，属于 AIResearch（AI 研究所）子项目。通过悬浮宠物「月薪喵」进入，输入文字任务，由手机后台的 Claude Code 调用工具操作手机。当前版本为 **0.4.0**。
+运行在 Android 手机上的轻量 Agent，属于 AIResearch（AI 研究所）子项目。通过悬浮宠物「月薪喵」进入，输入文字任务，由手机后台的 Claude Code 调用工具操作手机。当前版本为 **1.0.0**。
 
 本项目独立实现 Android App、工具桥接和运行时装配，没有复制 Buddy 的代码或界面。Linux 只提供后台运行环境，没有桌面或终端入口。
 
@@ -78,6 +78,16 @@ adb install --no-incremental -r build/PhoneAgent-debug.apk
 华为系统可能限制后台进程。如果遇到任务被系统中断，在应用启动管理中允许 PhoneAgent 后台活动。锁屏时请先手动解锁，再执行需要界面的操作。
 
 ## 验证
+
+日常改界面后，在已连接、解锁且空闲的手机上运行：
+
+```bash
+python3 scripts/regress-ui.py
+```
+
+它直接验收已安装 App，默认不调用模型、不启动 Claude、不跑 instrumentation，也不重新构建安装；自动记录每步耗时、截图、数据哈希及跳过项。默认整体限时 240 秒。输出位于被 Git 忽略的 `local/ui-regression/`。参数、覆盖范围与较慢集成测试的区别见 [回归测试说明](docs/testing.md)。
+
+1.0.0 以已验收的月薪喵气泡界面为版本基线，新增可重复执行的快速回归脚本。默认 UI 回归实测约 2 分 7 秒通过，59 项主机测试通过，见 [发布说明](docs/releases/1.0.0.md) 与 [1.0.0 实机记录](docs/validation/2026-11-05-huawei-ctr-al00-v1.0.0.md)。
 
 0.4.0 采用月薪喵暖色视觉，顶部集中功能、下方左右对话气泡，保留折叠过程、Markdown 结果和底部输入，见 [0.4.0 实机记录](docs/validation/2026-11-05-huawei-ctr-al00-v0.4.0.md)。
 

@@ -1,5 +1,9 @@
 # Device smoke tests
 
+For routine UI regression against an already-installed app, start with `python3 scripts/regress-ui.py`. It uses bounded ADB navigation without instrumentation, Claude, model calls or accessibility toggling. See [the fast regression guide](../../docs/testing.md) for coverage, timing reports and skips. The heavier modes below are selected integration tests, not a default all-modes checklist.
+
+The legacy `pet` mode assumes `statePet` is a descendant of the scrollable content. Since 0.4.0 the pet is fixed in the header, so that mode must be updated before reuse. It is not part of the new default regression.
+
 This separate test APK uses Android's built-in `Instrumentation` API. It adds no exported test endpoint to PhoneAgent. Run it on an unlocked device after installing the app and enabling its accessibility service.
 
 Each test opens MainActivity, starts the app's foreground service and holds a bounded partial wake lock until cleanup. Runtime preparation therefore begins while the app is visible. Tools and loop tests bring other apps to the foreground; Huawei may still require allowing PhoneAgent to run in the background under its battery/app-launch settings. A partial wake lock alone is not a guarantee against vendor process freezing.
